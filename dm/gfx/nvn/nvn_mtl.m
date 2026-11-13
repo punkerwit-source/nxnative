@@ -37,6 +37,7 @@
 #include "msl_image.h"
 #include "dmsh_chain.h"   // DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree, one for every game (beside this file, tools/dmsh_chain.py --header)
 #include "game_profile.h"   // game profile constants (profile id, the profile's switches)
+#include "../../host/mem_tight.h"   // under 9 GB of jetsam room, or of physical RAM on the Mac: the caps below
 // Texture slot table per stage: 0-127 the combined handles (nvnCommandBufferBindTexture), 128-255 the separate texture binds (NVN_SEPTEX_SLOT0, nvn_obj.h)
 #define NTEX 256
 // The NVN driver's constant segments c0 and c2 (byte offsets, slot counts) and the binding kinds of the shader reflection have one definition, which the shader build reads too (dmsh_build.py through dmsh_abi.py)
@@ -334,10 +335,8 @@ static void res_remove(id<MTLAllocation> r) { @autoreleasepool {
 // a frame (issue #1823). Only textures the GPU can render or write to are taken (block-compressed assets keep exact allocations of their own, without the headroom). The new
 // texture is filled as a new allocation is (tex_init_fill or zeros; a family heap is zeroed through its largest description, a snapshot is copied into), so nothing it reads
 // depends on the reuse; the memory was the old texture's only up to that texture's last use, which completed, as with memory Metal frees and hands out again, so no alias flush is
-// added (resource_vis). Heaps idle for RH_IDLE_NS, and the oldest past
-// RH_CAP bytes waiting, leave the residency set when a submission begins (rh_trim). DM_NVN_RT_RECYCLE=0 makes each texture its own allocation and each family heap exact and freed
+// added (resource_vis). Heaps idle for 3 s (1 s on a tight device), and the oldest past 256 MB waiting (32 MB on a tight device), leave the residency set when a submission begins (rh_trim, DM_GPU_PURGE). DM_NVN_RT_RECYCLE=0 makes each texture its own allocation and each family heap exact and freed
 // with its last texture, as before; ab alternates it with the DM_AB phases
-enum { RH_CAP = 256u << 20 }; static const uint64_t RH_IDLE_NS = 3000000000ull;
 typedef struct { void *heap; uint64_t size, t; } rh_ent;   // heap: retained (CFBridgingRetain); t: when it began to wait
 static os_unfair_lock g_rh_lk = OS_UNFAIR_LOCK_INIT; static rh_ent *g_rh; static unsigned g_rh_n, g_rh_cap; static uint64_t g_rh_bytes;
 static _Atomic uint64_t g_rh_made, g_rh_reused, g_rh_trimmed;   // for the memory readout
@@ -410,14 +409,35 @@ static id<MTLTexture> rh_texture(const tex_t *t, MTLTextureDescriptor *d) {
         || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) return nil;
     return rh_place(d);
 }
-// When a submission begins: heaps that waited RH_IDLE_NS, and the oldest past RH_CAP bytes, leave the residency set and are freed
+static int mem_tight(void) {
+    static int v = -1;
+    if (v >= 0) return v;
+#if TARGET_OS_IPHONE
+    uint64_t room = os_proc_available_memory();
+#else
+    uint64_t room = 0;
+#endif
+    v = dm_mem_tight_room(getenv("DM_MEM_TIGHT"), room, dm_phys_ram());
+    return v;
+}
+// When a submission begins: heaps that waited out their idle time, and the oldest past the cap, leave the residency set and are freed.
+// On a tight device the cap is 32 MB and the idle time 1 s (DM_GPU_PURGE); otherwise 256 MB and 3 s
+static int gpu_purge_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = dm_gpu_purge(mem_tight(), getenv("DM_GPU_PURGE"));
+        if (v) MLOG("recycled texture heaps: freed past %llu MB or after %llu s idle (DM_GPU_PURGE)", (unsigned long long)(dm_gpu_heap_cap(1) >> 20), (unsigned long long)(dm_gpu_heap_idle_ns(1) / 1000000000ull));
+    }
+    return v;
+}
 static void rh_trim(void) {
     if (!g_rh_n) return;
+    int purge = gpu_purge_on(); uint64_t cap = dm_gpu_heap_cap(purge), idle = dm_gpu_heap_idle_ns(purge);
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC); void *drop[64]; unsigned nd = 0;
     os_unfair_lock_lock(&g_rh_lk);
     while (g_rh_n && nd < 64) {
         unsigned old = 0; for (unsigned i = 1; i < g_rh_n; i++) if (g_rh[i].t < g_rh[old].t) old = i;
-        if (now - g_rh[old].t < RH_IDLE_NS && g_rh_bytes <= RH_CAP) break;
+        if (now - g_rh[old].t < idle && g_rh_bytes <= cap) break;
         drop[nd++] = g_rh[old].heap; g_rh_bytes -= g_rh[old].size; g_rh[old] = g_rh[--g_rh_n];
     }
     os_unfair_lock_unlock(&g_rh_lk);
@@ -879,6 +899,28 @@ static int big_of(uint64_t addr) { for (int i = 0; i < g_nbig; i++) if (addr >= 
 // of several pools can be one step for every lookup (mtl_pool_replace)
 typedef struct { const void *mem; uint64_t size; uintptr_t lo, hi, a, b; __strong id<MTLBuffer> buf; } pool_new;   // buf nil: in chunks (a large pool)
 static int pool_chunks(void) { static int c = -1; if (c < 0) { const char *e = getenv("DM_NVN_POOL_CHUNKS"); c = !e || atoi(e); } return c; }
+// BIG_MIN (512 MB) on an ordinary device. On a tight one, 64 MB: a pool Metal would otherwise wire whole is split, and only the
+// parts a lookup reaches stay wired (DM_NVN_POOL_CHUNK_MIN overrides). The system on an 8 GB iPad or M1 Air is already using part of the RAM
+static uint64_t big_min(void) {
+    static uint64_t v; if (v) return v;
+    const char *e = getenv("DM_NVN_POOL_CHUNK_MIN");
+    uint64_t n = e && *e ? dm_env_size(e) : mem_tight() ? (64ull << 20) : (uint64_t)BIG_MIN;
+    if (n < (uint64_t)BIG_S) n = BIG_S;
+    v = n;
+    if (n != (uint64_t)BIG_MIN) MLOG("memory pools of %llu MB or more stay in %u MB chunks (DM_NVN_POOL_CHUNK_MIN)", (unsigned long long)(n >> 20), BIG_S >> 20);
+    return v;
+}
+// The raw-memory table otherwise makes one buffer over a whole chunked pool the first time any address in it is used (gmem_map). That wires every page.
+// Off on a tight device: the table lists the chunks lookups have made, and an address with no chunk is not reached. DM_NVN_POOL_FULL=1 keeps the whole-pool buffer
+static int pool_full_wire(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_NVN_POOL_FULL");
+        v = e && *e ? atoi(e) > 0 : !mem_tight();
+        if (!v) MLOG("raw global memory: a large pool is not wired whole (DM_NVN_POOL_FULL=1 does that). Only chunks a lookup has made are resident");
+    }
+    return v;
+}
 static id<MTLBuffer> pool_buf_made(const void *mem, uint64_t size, uintptr_t a, uintptr_t b) {
     id<MTLBuffer> buf = pool_buf(a, b);
     // Pokémon Legends: Z-A: twice on the Mac a small pool's buffer was refused although its pages were one read-write VM region, both times while another heavy job (a shader compile,
@@ -902,7 +944,7 @@ static id<MTLBuffer> pool_buf_made(const void *mem, uint64_t size, uintptr_t a, 
 static void pool_new_prep(pool_new *n, const void *mem, uint64_t size) {
     uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)mem, hi = lo + size;
     *n = (pool_new){mem, size, lo, hi, lo & ~(pg - 1), (hi + pg - 1) & ~(pg - 1), nil};
-    if (size >= BIG_MIN && pool_chunks()) { pthread_mutex_lock(&g_mu); int room = g_nbig < BIG_MAX; pthread_mutex_unlock(&g_mu); if (room) return; }
+    if (size >= big_min() && pool_chunks()) { pthread_mutex_lock(&g_mu); int room = g_nbig < BIG_MAX; pthread_mutex_unlock(&g_mu); if (room) return; }
     n->buf = pool_buf_made(mem, size, n->a, n->b);
 }
 static void pool_new_put(pool_new *n) {   // caller holds g_mu
@@ -3314,8 +3356,10 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
                         ? reuse : [g_dev newTextureWithDescriptor:d];
     if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
     if (mt.allocatedSize >= (256u << 20)) { static int nb; if (nb++ < 20)   // the textures that take most of the GPU's memory (a GPU out-of-memory error says nothing of which)
-        MLOG("large texture ser=%llu %ux%ux%u format %#x target %d levels %u: %llu MB%s", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels,
-             (unsigned long long)(mt.allocatedSize >> 20), t->pool && nvn_sparse_pool(t->pool) ? ", in a sparse virtual pool" : t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) ? ", in a virtual pool" : ""); }
+        MLOG("large texture ser=%llu %ux%ux%u format %#x target %d levels %u: %llu MB, %s%s", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels,
+             (unsigned long long)(mt.allocatedSize >> 20), mt.storageMode == MTLStorageModePrivate ? "private" : mt.storageMode == MTLStorageModeShared ? "shared" : "other storage",
+             t->pool && nvn_sparse_pool(t->pool) ? ", in a sparse virtual pool" : t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) ? ", in a virtual pool" : "");
+        if (t->d.format == 0x32 && t->d.width >= 8192 && t->d.height >= 8192) { static int once; if (!once++) MLOG("large texture: this Depth16 is a fixed allocation the game samples (Ocarina's save load makes a 12288x12288). DM_RENDER_SCALE does not resize it; it stays private, one GPU copy"); } }
     if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
     res_add(mt);   // Both first upload and re-upload register residency here (Metal 4 does not make resources resident automatically; a missed registration = GPU address page fault)
     int sparse = t->pool && nvn_sparse_pool(t->pool);
@@ -4607,8 +4651,10 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct, int *in_storage) {
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
     }
     if (mt.allocatedSize >= (256u << 20)) { static int nb; if (nb++ < 20)   // the textures that take most of the GPU's memory (a GPU out-of-memory error says nothing of which)
-        MLOG("large texture ser=%llu %ux%ux%u format %#x target %d levels %u: %llu MB%s", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels,
-             (unsigned long long)(mt.allocatedSize >> 20), t->pool && nvn_sparse_pool(t->pool) ? ", in a sparse virtual pool" : t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) ? ", in a virtual pool" : ""); }
+        MLOG("large texture ser=%llu %ux%ux%u format %#x target %d levels %u: %llu MB, %s%s", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels,
+             (unsigned long long)(mt.allocatedSize >> 20), mt.storageMode == MTLStorageModePrivate ? "private" : mt.storageMode == MTLStorageModeShared ? "shared" : "other storage",
+             t->pool && nvn_sparse_pool(t->pool) ? ", in a sparse virtual pool" : t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) ? ", in a virtual pool" : "");
+        if (t->d.format == 0x32 && t->d.width >= 8192 && t->d.height >= 8192) { static int once; if (!once++) MLOG("large texture: this Depth16 is a fixed allocation the game samples (Ocarina's save load makes a 12288x12288). DM_RENDER_SCALE does not resize it; it stays private, one GPU copy"); } }
     if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
     if (getenv("DM_NVN_TEXCPU") && t->pool && !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) MLOG("non-swizzled texture on a CPU-visible pool ser=%llu %ux%ux%u format %#x target %d levels %u texture flags %#x pool flags %#x storage %p", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, t->d.flags, t->pool->flags, (void *)t->mem);
     res_add(mt);
@@ -4633,14 +4679,16 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     pthread_mutex_unlock(&g_smu);
     unsigned long dead_n = 0; unsigned long long dead_mb = 0;
     // Objects read from a weak table come back retained + autoreleased: the frame hook runs on a guest thread with no autorelease pool that drains, so without this wrapper every buffer counted would be pinned for good (the readout creating the leak itself)
-    int pres = 0; @autoreleasepool { pthread_mutex_lock(&g_mu); pres = g_pool_res_n; for (id<MTLBuffer> b in g_dead_pools) { dead_n++; dead_mb += b.length; } pthread_mutex_unlock(&g_mu); } dead_mb >>= 20;   // host objects held by serial (textures / packaged textures / programs): if it climbs along with GPU allocated, textures are not being released
+    int pres = 0; unsigned long long pres_b = 0; @autoreleasepool { pthread_mutex_lock(&g_mu); pres = g_pool_res_n;
+        for (int i = 0; i < g_npool; i++) if (g_pools[i].res && g_pools[i].buf) pres_b += g_pools[i].buf.length;   // zero-copy buffers over guest pages: wired while resident, the same pages, not a second copy
+        for (id<MTLBuffer> b in g_dead_pools) { dead_n++; dead_mb += b.length; } pthread_mutex_unlock(&g_mu); } dead_mb >>= 20;   // host objects held by serial (textures / packaged textures / programs): if it climbs along with GPU allocated, textures are not being released
     // os_proc_available_memory: how far this process is from being terminated by the system for memory, iOS only; the Mac writes "none". On a phone, a crash with no log is most likely this number reaching 0
     os_unfair_lock_lock(&g_rh_lk); unsigned rh_n = g_rh_n; uint64_t rh_bytes = g_rh_bytes; os_unfair_lock_unlock(&g_rh_lk);
     char avail[32] = "none";
 #if TARGET_OS_IPHONE
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
 #endif
-    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total), retired but held by a serial %u, recycled texture heaps made %llu, reused %llu, freed %llu, waiting %u (%llu MB); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)as.evicted, (unsigned long long)as.taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, nwait,
+    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d, %llu MB of zero-copy buffers; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total), retired but held by a serial %u, recycled texture heaps made %llu, reused %llu, freed %llu, waiting %u (%llu MB); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, (unsigned long long)(pres_b >> 20), peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)as.evicted, (unsigned long long)as.taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, nwait,
          (unsigned long long)g_rh_made, (unsigned long long)g_rh_reused, (unsigned long long)g_rh_trimmed, rh_n, (unsigned long long)(rh_bytes >> 20), avail);
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf, tc, tcb;
       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
@@ -8694,6 +8742,9 @@ static id arch_lookup(MTL4PipelineDescriptor *d, int plain, int *from_run) {
 }
 static ArchEpoch *g_ep; static os_unfair_lock g_ep_lock = OS_UNFAIR_LOCK_INIT;   // the current period
 static int g_arch_cap;   // compiles are captured (an archive folder, a serializer): immutable after pso4_init
+static _Atomic int g_arch_capped;   // a capture failed for good (arch_cap_failed); the size cap rotates files instead of setting this
+static uint64_t g_arch_bytes, g_arch_max = UINT64_MAX;
+static NSMutableArray<NSString *> *g_arch_order;   // archive files on disk, oldest first, so the size cap can delete them
 static dispatch_group_t g_arch_pending;   // periods handed over and not written yet
 static _Atomic uint64_t g_pb_built, g_pb_archived, g_pb_reused, g_pb_spec, g_pb_legacy, g_pb_base_ns;
 // Time by kind, all threads (the 'pipelines up to frame' line): archive lookups that found the base / found none, specializations, base compiles; predictions (submit thread)
@@ -8937,7 +8988,27 @@ static int arch_compact_takes(id<MTL4Archive> a) {   // a pipeline was found in 
     NSUInteger i = [g_arch_run.count ? g_arch_run : g_arch4 indexOfObjectIdenticalTo:a]; return i != NSNotFound && g_compact_state[i];   // g_arch4: a start that found no run file (the tests set it, files of no index)
 }
 static _Atomic int g_arch_cap_off;   // capturing failed in a period that held nothing yet: the store was not full, so no more captures this run (arch_cap_failed)
-static int arch_capturing(void) { return g_arch_cap && !atomic_load_explicit(&g_arch_cap_off, memory_order_relaxed); }
+static int arch_capturing(void) { return g_arch_cap && !atomic_load_explicit(&g_arch_cap_off, memory_order_relaxed) && !atomic_load_explicit(&g_arch_capped, memory_order_relaxed); }
+static void arch_evict_oldest(void) {   // disk only: an open archive keeps its mapping until exit, and the next launch does not open a deleted file
+    if (g_arch_max == UINT64_MAX || !g_arch_order) return;
+    int n = 0; unsigned long long freed = 0;
+    while (g_arch_bytes > g_arch_max && g_arch_order.count > 1) {
+        NSString *p = g_arch_order.firstObject;
+        unsigned long long sz = [[NSFileManager.defaultManager attributesOfItemAtPath:p error:nil] fileSize];
+        unlink(p.fileSystemRepresentation); unlink(arch_keys_path(p).fileSystemRepresentation);
+        [g_arch_order removeObjectAtIndex:0];
+        if (sz && g_arch_bytes >= sz) g_arch_bytes -= sz; else if (!sz && g_arch_bytes) g_arch_bytes = g_arch_bytes > (16ull << 20) ? g_arch_bytes - (16ull << 20) : 0;
+        freed += sz; n++;
+    }
+    if (n) MLOG("pipeline archive: deleted %d oldest files (%.1f MB) so the folder stays within %.1f MB (DM_PSO_ARCHIVE_MAX); %.1f MB left on disk, and new pipelines are still written", n, freed / 1048576.0, g_arch_max / 1048576.0, g_arch_bytes / 1048576.0);
+}
+static void arch_note_bytes(NSString *path, unsigned long long n) {
+    if (g_arch_max == UINT64_MAX) return;
+    if (!g_arch_order) g_arch_order = [NSMutableArray array];
+    if (path) [g_arch_order addObject:path];
+    g_arch_bytes += n;
+    arch_evict_oldest();
+}
 static void arch_flush_from(ArchEpoch *only);
 static void arch_at_exit(void);
 // The capture refused a pipeline the plain compiler built. The archive is a cache and never a condition of drawing: the pipeline is used all the same. A period that has captured
@@ -9040,6 +9111,20 @@ static void pso4_init(void) {
             if (pold) unlink([g_arch_dir stringByAppendingPathComponent:@"prebuilt.tsv"].fileSystemRepresentation);
             if (nold) MLOG("pipeline archive: %d files indexed by library file names removed (%d of them the prebuild's): their bases are built again once", nold, pold);
             names = keep;
+            g_arch_max = dm_pso_archive_max(mem_tight(), getenv("DM_PSO_ARCHIVE_MAX"));
+            if (g_arch_max != UINT64_MAX) {
+                NSMutableArray<NSString *> *fit = [NSMutableArray array]; unsigned long long opened_b = 0, freed = 0; int ndel = 0;
+                for (NSString *n in names) {   // newest first: keep a prefix that fits, delete the older files so the next capture can be written
+                    NSString *p = [g_arch_dir stringByAppendingPathComponent:n];
+                    unsigned long long sz = [[NSFileManager.defaultManager attributesOfItemAtPath:p error:nil] fileSize];
+                    if (opened_b + sz <= g_arch_max) { opened_b += sz; [fit addObject:n]; }
+                    else { unlink(p.fileSystemRepresentation); unlink(arch_keys_path(p).fileSystemRepresentation); freed += sz; ndel++; }
+                }
+                g_arch_bytes = opened_b; g_arch_order = [NSMutableArray array];
+                for (NSString *n in fit.reverseObjectEnumerator) [g_arch_order addObject:[g_arch_dir stringByAppendingPathComponent:n]];   // oldest first
+                if (ndel) MLOG("pipeline archive: deleted %d oldest files (%.1f MB) so %.1f MB fit the cap of %.1f MB (DM_PSO_ARCHIVE_MAX). New pipelines are written; the oldest file goes when the folder is over the cap again", ndel, freed / 1048576.0, opened_b / 1048576.0, g_arch_max / 1048576.0);
+                names = fit;
+            }
             // each file with its index, in parallel: opening one takes about 15 ms (Breath of the Wild: 52 files in 715 ms, 78 in 1.2 s, one at a time)
             NSUInteger nn = names.count; NSMutableArray *opened = [NSMutableArray arrayWithCapacity:nn], *ixs = [NSMutableArray arrayWithCapacity:nn], *why = [NSMutableArray arrayWithCapacity:nn];
             for (NSUInteger i = 0; i < nn; i++) { [opened addObject:NSNull.null]; [ixs addObject:NSNull.null]; [why addObject:NSNull.null]; }
@@ -9191,9 +9276,11 @@ static void arch_write_file(ArchEpoch *ep) {
     if (!ok && keyed) unlink(kp.fileSystemRepresentation);
     if (!ok) { MLOG("[RED] pipeline archive: writing %s failed%s%s", path.UTF8String, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); unlink(tmp.fileSystemRepresentation); if (ep->compacting) g_compact_bad = 1; }
     else {
+        unsigned long long wrote = [[NSFileManager.defaultManager attributesOfItemAtPath:path error:nil] fileSize];
+        arch_note_bytes(path, wrote);
         MLOG("pipeline archive: %d new pipeline bases%s%s written to %s (%.1f MB, %.0f ms; compiles held back by the writes so far: %llu, %.0f ms in all)", n - cs - ms,
              cs ? [NSString stringWithFormat:@" and %d compute pipelines", cs].UTF8String : "", ms ? [NSString stringWithFormat:@" and %d task / mesh pipelines", ms].UTF8String : "",
-             path.lastPathComponent.UTF8String, [[NSFileManager.defaultManager attributesOfItemAtPath:path error:nil] fileSize] / 1048576.0, (bp_now() - t0) / 1e6,
+             path.lastPathComponent.UTF8String, wrote / 1048576.0, (bp_now() - t0) / 1e6,
              (unsigned long long)atomic_load(&g_ser_holds), atomic_load(&g_ser_held_ns) / 1e6);
     }
 }
@@ -10469,13 +10556,21 @@ static int tex_storage_live(const tex_t *t) {
 // pool's copy, and making them all took Ocarina of Time's Kokiri Forest past Metal's 12.1 GB working set on a 16 GB Mac, once into a kernel panic in IOGPUGroupMemory at 14.7 GB wired. Shaders read few of
 // them: about 300 of its 33,000 IDs, about 1 GB. So a shader's read sets the ID's bit (pool_seen, dmsh_reflect.py pool_arrays) and those are made whatever the budget, up to POOL_REQ_BYTES a frame, which
 // was also the black scenery: a budget without this left out exactly the large textures those shaders read. A walk still makes the smallest textures up front, POOL_FRAME_BYTES a frame up to a twentieth of
-// the working set, as a pass that runs once (a bake) has no second frame to find its texture in. Each upload reads pages the system may have swapped out and wires them: one 300-frame window spent 8.6 s
+// the working set, as a pass that runs once (a bake) has no second frame to find its texture in. On a tight device (an 8 GB iPad or M1 Air, whose system is already using part of that RAM)
+// the walk stops at 1536 MB instead (DM_GPU_BUDGET); textures a shader has read are still made. Each upload reads pages the system may have swapped out and wires them: one 300-frame window spent 8.6 s
 // in residency commits. A read of the rest finds the dummy for a few frames
 enum { POOL_FRAME_BYTES = 32u << 20, POOL_REQ_BYTES = 128u << 20, POOL_SUB_MS = 2 };
 static uint64_t g_walk_frame = ~0ull, g_walk_spent, g_walk_sub = ~0ull; static double g_walk_ms; static int g_walk_over;
 static uint64_t pool_tex_size(const tex_t *t) { return t->L.size ? t->L.size : 1; }
 static int pool_size_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
-static uint64_t pool_budget(void) { return g_dev.recommendedMaxWorkingSetSize / 20; }
+static uint64_t pool_budget(void) {
+    static uint64_t cap = ~0ull; static int told;
+    if (cap == ~0ull) cap = dm_gpu_budget_cap(mem_tight(), getenv("DM_GPU_BUDGET"));
+    uint64_t b = g_dev.recommendedMaxWorkingSetSize / 20;
+    if (!told) { told = 1; if (cap && b > cap) MLOG("speculative textures stop at %llu MB (DM_GPU_BUDGET; Metal's working set would allow %llu MB)", (unsigned long long)(cap >> 20), (unsigned long long)(b >> 20)); }
+    if (cap && b > cap) b = cap;
+    return b;
+}
 static uint64_t g_walk_req;
 // A render target no pass has written holds nothing to read, and a pass makes its texture when it renders. Made for a read, one that only registers next frame's target took three times the
 // textures and 17 GB allocated on Ocarina of Time: the game re-registers its IDs with transient targets, whose IDs a shader read as the previous texture
@@ -11022,7 +11117,7 @@ static id<MTLBuffer> gmem_map(void) {
     for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
     int n = 1, over = 0; uint64_t end = 0;
     pthread_mutex_lock(&g_mu);
-    for (int k = 0; k < g_nbig; k++) if (!g_big[k].full && addr_meets(g_big[k].lo, g_big[k].hi)) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }   // the pool table reaches all of a large pool
+    if (pool_full_wire()) for (int k = 0; k < g_nbig; k++) if (!g_big[k].full && addr_meets(g_big[k].lo, g_big[k].hi)) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }   // the pool table reaches all of a large pool; a tight device leaves it in chunks (pool_full_wire)
     gen = atomic_load(&g_pool_gen); pidx_sort();
     for (int k = 0; k < g_npool; k++) {
         pool_ent *p = &g_pools[g_pidx[k]];

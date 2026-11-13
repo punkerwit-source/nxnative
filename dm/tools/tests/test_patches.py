@@ -144,6 +144,20 @@ class Registry(unittest.TestCase):
         self.assertIn(0x52800048, words)   # mov w8,#2: the cap
         self.assertEqual(ctx.step_max, 2)
 
+    def test_ocarina_render_floor_is_in_the_level_stub(self):
+        # state +0x44 is the minimum level (ldr w15,[x16,#0x44]); scale 1 leaves it 0, so the climb's result is what returns
+        m = MODS[REPO / 'dm/games/0400486024DEC000/patches.py']
+        words = []
+        ctx = docs_patches.types.SimpleNamespace(here=lambda: 0x8000000, emit=words.append, site=lambda off, orig: None, put=lambda off, w, why: None,
+                                                 state=0x9000000, render_scale=0, step_max=0, base=0x100000,
+                                                 others={'dynamic resolution': 0x1000, 'dynamic resolution update': 0x2000}, capabilities=set())
+        m.dynamic_resolution(ctx)
+        self.assertEqual(ctx.render_scale, 1)
+        self.assertIn('DYNAMIC_RESOLUTION', ctx.capabilities)
+        self.assertIn('RENDER_FLOOR', ctx.capabilities)
+        self.assertIn(0xb940460f, words)          # ldr w15, [x16, #0x44]
+        self.assertEqual(words.count(0xd65f03c0), 1)
+
     def test_sdk_wide_rules_change_what_their_names_say(self):
         # the rules were taken from registered SDK cuts, and the builds they reproduce exactly have no row any more: each cut replaces the constant its rule names (0x3fe00000, the node
         # area; 0x400000, 0x2000000 and 0x40000000, the alignments of the 4 MB, 32 MB and 1 GB classes; as movz or orr from wzr) with the reviewed one (62 MB; SDK 20's 2 MB) in the same register
