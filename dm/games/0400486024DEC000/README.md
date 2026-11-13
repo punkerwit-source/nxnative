@@ -14,6 +14,7 @@ A Switch 2 game: update v131072, SDK 22.2.8 (`Ounce`). Nintendo EPD's engine (se
 | `tex_flush_upload on`, `tex_dirty_upload on` | `game.tsv` | as Tears of the Kingdom: the CPU writes the terrain tiles' height (R32F), blend and hole (RGBA8) maps into textures after creating them. Without the keys those textures stay zero: flat blue holes in the ground around the path with grass floating in them, and grey stone where the console shows dirt |
 | `shader_groups`, `shader_note` | `game.tsv` | shaders grouped as `/Shader/`, `/Effect/`, `/Lib/`, `/UI/` |
 | `pad_layout full` | `game.tsv` | a 3D field and both sticks |
+| Render-scale floor | [`patches.py`](patches.py) level function, state +0x44 | `DM_RENDER_SCALE`. On an 8 GB iPad or M1 Air, unset keeps about 0.67 of full size ([Low memory](#low-memory)) |
 
 Render conditions, which the host evaluates for every game ([Conditional rendering evaluated at replay](../../../docs/reference/rendering.md#conditional-rendering-evaluated-at-replay); until 2026-11-12 the profile key `render_cond`): agl clears a copy of the prepass depth again under a render condition the console skips. Run unconditionally, the opaque pass's `EQUAL` test fails everywhere ([PR 1299](https://github.com/seedds/nxnative/pull/1299)'s finding).
 
@@ -73,6 +74,33 @@ Measured on an M6 Mac with 16 GB, headless, on one walk with camera turns (`walk
 - Where the full-resolution GPU frame goes (M4 Pro, Metal System Trace, 2026-11-08): vertex/mesh 4.9, fragment 5.2, compute 4.3 ms per 1/60 s, and they do not overlap (their union is 14.4 ms, their sum 14.4). The heaviest passes: the main mesh pass (task `a5288d0a6c4971fd`, mesh `3439aaa071d868ae`, fragment `a1a56cf6d62ae798`), two foliage passes (task `47f9b38490dcf9a2`), and the upscaler's compute (`fa3033d05c0a41d6`, 177 HMMA calls, already on `simdgroup` matrices). Ruled out: the stage serialization is mostly the game's own barriers (about 70 a frame, 39 of them `ORDER_PRIMITIVES | INVALIDATE_TEXTURE`). The relaxed draw-pass barriers of `draw_barriers game` were then off whenever an image family heap existed (this game's dynamic-resolution depth buffer makes one). Keeping them on with the alias flush moved to a start barrier skipped 22% of the full barriers, but the real GPU span on this M4 Pro did not change (14.7 ms p50 either way, two runs each). That change is on main now, with fragment-only barriers no longer forcing the full one, for its gain on the M1 Max ([Draw passes that wait for each other again while images share memory](../../../docs/reference/frame-rate.md#draw-passes-that-wait-for-each-other-again-while-images-share-memory)). Also ruled out: mesh shaders writing only the vertices their primitives use (the highest index + 1, instead of all `max_v`), as an overlay of the 31 play mesh shaders against the same shaders recompiled: span 14.7 / 15.5 ms against 16.0 / 15.6, so the game's meshlets are full. A shader timeline needs the trace attached before the pipelines are made, and a recording from 3 s to the play window (9 GB, or 45 s with the shader profiler) never finished saving.
 - Measured on the M4 Pro (20-core GPU, 2026-11-08, `kokiri-deck`, one run each): at full resolution (the main passes 1536x864 in pass dumps at 75, 100 and 125 s) 48.1 fps, frame p50 16.74 / p95 33.41 ms, GPU p50 15.0 / p95 16.9 ms: the GPU needs about one vsync a frame, so the frame step holds 2 vsyncs much of the time. With the game's own dynamic resolution and the host fixes above: 60 fps, GPU p50 12.6 ms, at a lower resolution. A second dynamic-resolution run wandered off the route into Saria's dialogue and is not counted.
 
+## Render scale
+
+`DM_RENDER_SCALE` (0.5 to 1.0) picks a minimum level of the game's own list, through state +0x44. 1.0, and any device that is not tight, leaves the level at 0: full size, and the dynamic-resolution climb is unchanged. Another factor is the finest level the climb may use, and with dynamic resolution off it is the level used. The levels run from 0.75 to 0.333 of the output, so 0.67 is about level 5 and 0.5 is about level 8. The HUD and the upscaler's fixed target are not scaled. Not measured on a device yet.
+
+## Low memory
+
+An 8 GB iPad Pro 12.9 (M2, iPad14,6) and an 8 GB MacBook Air (M1) do not have 8 GB free for the game. The iPad's log at start says `room to the memory limit 7.96 GB` against a 9 GB pool, so the guest is in files (`13 files of 1.00 GB`). macOS on the Air is in the same 8 GB as the game and is already using some of it; there is no jetsam room, so the same policies follow physical RAM under 9 GB. A 12 GB iPhone and a 16 GB Mac stay on the ordinary path. `DM_MEM_TIGHT=0` forces that path on the 8 GB machines, and `1` forces the tight path anywhere.
+
+What the iPad log showed in the overworld, and what each change is for:
+
+- Process footprint 3.3–3.8 GB, GPU allocated about 5095 MB against about 3.5 GB on the 12 GB iPhone, and about 165k guest-file page-ins per 10 s. Thermal state stayed 0 while the GPU p50 went from about 20 ms to about 45 ms and the frame rate to 9–11 fps. The page-ins are the guest's file pages being pushed out by wired GPU memory and the system's own pages, then faulted back. The guest stays in files on the iPad: an anonymous 9 GB pool would be charged to the footprint and the system would end the app. On the Mac the guest stays anonymous, because macOS can swap it; `DM_GUEST_FILE=1` opts into files.
+- The speculative texture walk fills up to a twentieth of Metal's recommended working set. On a tight device it stops at 1536 MB (`DM_GPU_BUDGET`), which leaves the system's share of the 8 GB. Textures a shader has read are still made. Recycled render-target heaps are freed past 32 MB or after 1 s (`DM_GPU_PURGE`).
+- The 12288×12288 depth texture (about 296 MB) is already private GPU storage. It is sampled, so it is not shrunk. The log line now names the storage (`private` or `shared`).
+- With `DM_PSO_MTL4=1` the device archive grew to about 8.7 GB and was mapped whole. On a tight device only the newest 256 MB is opened (`DM_PSO_ARCHIVE_MAX`); the rest stay on disk, and once the folder is at the cap nothing more is written into it. `DM_PSO_MTL4=0` prebuilds every shader and used more memory.
+- `DM_GUEST_FILE_ADVISE` (on with the files, on a tight device) sets `MADV_RANDOM` so a fault does not pull neighbouring pages. `DM_GUEST_FILE_MIN_FREE` stays 2 GB: that figure is free disk, not RAM.
+
+Recommended `Documents/env.txt` on the 8 GB iPad, and the same keys on the 8 GB Air (the Air has no `env.txt` unless the run sets them; the defaults above already apply):
+
+```
+DM_FPS_TARGET=30
+DM_DYNAMIC_RESOLUTION=1
+DM_PSO_MTL4=1
+DM_FPS_HOLD=off
+```
+
+`DM_RENDER_SCALE=0.67` is what an unset scale does on these two machines. Set `1` for full size, or `0.5` if the page-ins and the GPU-allocated line are still high. `DM_GPU_BUDGET=1024M` and `DM_PSO_ARCHIVE_MAX=128M` tighten further. Compare, per 10 s or per 300 frames: GPU p50, the frame time, `GPU allocated` in `memory up to frame`, `page-ins` in `[mem] guest file`, and `headroom to the system memory limit`. On the Air there is no guest-file line unless `DM_GUEST_FILE=1`; watch the footprint and swap instead.
+
 ## Memory
 
 - Current: on the walk, run from an external drive with a 3.5 GB pipeline archive: resident 10.9-11.4 GB, wired about 9.4 GB, on a 16 GB Mac. `vmmap` and `footprint`: 6.4 GB of guest memory and 3.8 GB of Metal textures and targets, 1 GB of IOAccelerator memory. [Reading the archive into memory](../../../docs/reference/memory.md#a-pipeline-archive-on-an-external-drive-is-read-into-memory) used to add 3.5 GB (footprint 15.0, peak 16.7). `mem_map_limit on`: a map past the application pool fails as on Horizon, and the SDK's allocator then gives back the pages it keeps. Other apps' memory adds to the swap: other games running beside it can push the Mac over.
@@ -128,6 +156,9 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 
 ## Found on this game
 
+- [Speculative textures fill Metal's working set on an 8 GB machine](../../../docs/reference/memory.md#speculative-textures-fill-metals-working-set-on-an-8-gb-machine): the iPad's GPU allocated line sat near 5 GB while the 12 GB iPhone stayed near 3.5 GB. Not measured on the M1 Air yet.
+- [A pipeline archive mapped past the RAM the system is using](../../../docs/reference/memory.md#a-pipeline-archive-mapped-past-the-ram-the-system-is-using): `pso_archive` grew to about 8.7 GB on the iPad and was opened whole.
+- [Guest file faults pull neighbouring pages](../../../docs/reference/memory.md#guest-file-faults-pull-neighbouring-pages): about 165k page-ins per 10 s in the overworld, with the system already holding part of the 8 GB.
 - [Sparse mappings under cached texture bindings](../../../docs/reference/nvn-objects.md#sparse-mappings-under-cached-texture-bindings): found in an audit of the host's caches (PR #1721); a mapping under a texture with no serial change after it left the texture's old pages in its cached bindings.
 - [Captures still queued on the harvest queue left out of a waiting flush](../../../docs/reference/rendering.md#captures-still-queued-on-the-harvest-queue-left-out-of-a-waiting-flush): resolved, the prebuild tool trapped at exit in one Mac app build of two and the app was packed without its prewarm files ([GitHub issue #2498](https://github.com/seedds/nxnative/issues/2498)).
 - [A fence after every shared memory store crashes Apple's compiler](../../../docs/reference/shaders.md#a-fence-after-every-shared-memory-store-crashes-apples-compiler): fixed on the Mac side, retest on an M2 open ([GitHub issue #2481](https://github.com/seedds/nxnative/issues/2481)). The foliage pipeline (task `a7f22b4a795ff4d1`, mesh `f85bb2e8d78b864c`) crashed the M2's compiler in 39 of 39 runs with the fence after every store. The translator now fences only loads that follow a store with no barrier between: the fenced shaders went from 25,108 fences to 1,566, and the mesh shaders have none. Whether the GPU hangs seen with the old fences (7 of 9 long runs) are gone is also open.

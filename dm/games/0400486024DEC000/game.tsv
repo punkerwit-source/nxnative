@@ -43,6 +43,8 @@ fps_target	60
 
 # ---- Graphics ----
 draw_barriers	game
+# Top internal size at graphics scale tier 0 (the note, Render scale). DM_RENDER_SCALE picks a dynamic-resolution level near that fraction. Handheld was not measured apart from docked
+render_base	1920x1080 1920x1080
 # As Tears of the Kingdom: the terrain's height, blend and hole maps are written by the CPU into textures after they are created. Without these keys they stay zero: holes in the ground and the wrong materials
 tex_flush_upload	on
 tex_dirty_upload	on

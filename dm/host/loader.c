@@ -1,6 +1,7 @@
 // Multi-module loading (playing the role of Horizon's rtld): mapping, claiming thread slots, gate registration, cross-module relocation, take-over by name, segment permissions.
 // The code area (original text and patch area) is set to read-only+execute as soon as it is copied in, and from then on the loader only writes data: on iOS these two blocks must be embedded as is as signed code segments.
 #include "dm.h"
+#include "mem_tight.h"
 #include <TargetConditionals.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -13,6 +14,7 @@
 #include "hle.h"
 #if TARGET_OS_IPHONE
 #include <mach/mach.h>
+#include <os/proc.h>
 #endif
 
 module_t *g_mod;
@@ -266,6 +268,7 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "DATA_OFF")) m->data_off = v;
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
         else if (!strcmp(key, "RENDER_SCALE")) m->render_scale_max = (uint32_t)v;
+        else if (!strcmp(key, "DYNAMIC_RESOLUTION")) m->dyn_res = (int)v;
         else if (!strcmp(key, "STEP_MAX")) m->step_max = (uint32_t)v;
         else if (!strcmp(key, "UE_MALLOC_VT")) m->ue_malloc_vt = v;
         else if (!strcmp(key, "UE_MALLOC_SLOT")) m->ue_malloc_slot = (unsigned)v;
@@ -309,10 +312,12 @@ uint8_t *dm_fps_state;
 int dm_fps_step_max;   // the largest step the stubs give the game (STEP_MAX in its fixups table; 0 = FSTEP_MAX): the frame step holds frames and pays back within it (hle_nvn.c)
 static const char *g_fps_mod;   // the module holding the state page (for the log)
 static float g_render_scale_max = 1.0f;   // the render-scale stub's largest scale (RENDER_SCALE in its fixups table; 1 for a stub that only lowers the game's size)
+static int g_dyn_res;   // the DYNAMIC_RESOLUTION capability: state +0x44 is a minimum level (Ocarina of Time)
 static void install_fps_state(module_t *m) {
     if (m->fps_state_off + 0x40 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
     dm_fps_state = m->base + m->fps_state_off; g_fps_mod = m->name; dm_fps_step_max = (int)m->step_max;
     if (m->render_scale_max > 1) g_render_scale_max = (float)m->render_scale_max;
+    if (m->dyn_res) g_dyn_res = 1;
 }
 // The settings in the state page, written when the game starts (main.c, after host loading): on iOS the loading runs at app launch, before the launcher has set DM_FPS_TARGET and
 // DM_RENDER_SCALE (Launcher.swift), and nothing reads the page before the game runs
@@ -327,6 +332,24 @@ void dm_fps_state_apply(void) {
     const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f, hi = g_render_scale_max;
     if (rs) { char *end; sc = strtof(rs, &end); if (end == rs || *end || !(sc >= 0.5f && sc <= hi)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to %.1f; keeping the game's size", rs, hi); sc = 1.0f; } else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", g_fps_mod, sc); }
     memcpy(dm_fps_state + 0x10, &sc, sizeof sc);
+    // Ocarina's level stub reads a minimum level here (0 = full size). Other games leave the word 0. A tight device with the scale unset uses 0.75, about level 4 of its list;
+    // DM_RENDER_SCALE=1 keeps full size on that device too
+    uint32_t floor = 0;
+    if (g_dyn_res) {
+        uint64_t room = 0;
+#if TARGET_OS_IPHONE
+        room = os_proc_available_memory();
+#endif
+        int tight = dm_mem_tight_room(getenv("DM_MEM_TIGHT"), room, dm_phys_ram());
+        float use = sc;
+        if (!rs && tight) {
+            use = 0.67f;   // level 5: the 8 GB machines are already sharing RAM with the system, so full size is the opt-in
+            LOG("%s: render scale 0.67 (about level %u of the dynamic-resolution list) because this device is under 9 GB and the system is already using part of it (DM_RENDER_SCALE=1 keeps full size)", g_fps_mod, dm_oot_render_floor(use));
+        }
+        floor = dm_oot_render_floor(use);
+        if (rs && floor) LOG("%s: dynamic resolution no finer than level %u (DM_RENDER_SCALE %.2f)", g_fps_mod, floor, use);
+    }
+    memcpy(dm_fps_state + 0x44, &floor, sizeof floor);
     // The game's own dynamic resolution, for builds whose stubs read it (the DYNAMIC_RESOLUTION capability of a frame step stub: Ocarina of Time's level function): 1 lets it
     // run, 0 (the default) holds full resolution. Builds without such a stub ignore the field
     const char *dr = getenv("DM_DYNAMIC_RESOLUTION"); uint32_t dyn = dr && !strcmp(dr, "1");
