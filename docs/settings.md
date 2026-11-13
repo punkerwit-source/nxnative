@@ -283,6 +283,11 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Game's upscaler | `DM_UPSCALER` | `game`, `metalfx` |
 | Frame buffering | `DM_PRESENT_SNAP` | `1`, `0` |
 | Metal 4 pipelines | `DM_PSO_MTL4` | `1`, `0` |
+| Tight memory | `DM_MEM_TIGHT` | `1`, `0` (unset: on when under 9 GB to the limit, or under 9 GB of RAM on a Mac) |
+| GPU texture budget | `DM_GPU_BUDGET` | a size (`1536M`), or `0` for no cap. Unset: `1536M` when tight, no cap otherwise |
+| Recycled-heap trim | `DM_GPU_PURGE` | `1`, `0` (unset: on when tight) |
+| Pipeline archive cap | `DM_PSO_ARCHIVE_MAX` | a size (`256M`), or `0` for every file. Unset: `256M` when tight |
+| Guest file advice | `DM_GUEST_FILE_ADVISE` | `1`, `0` (unset: on when tight and the guest is in files) |
 | Pipeline prebuild | `DM_PSO_PREBUILD` | `1`, `0` |
 | Encode thread | `DM_NVN_ENC_THREAD` | `1`, `0` |
 | Hold frames when late | `DM_FPS_HOLD` | `on`, `off` |
