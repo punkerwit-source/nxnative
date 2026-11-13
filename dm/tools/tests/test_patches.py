@@ -154,6 +154,7 @@ class Registry(unittest.TestCase):
         m.dynamic_resolution(ctx)
         self.assertEqual(ctx.render_scale, 1)
         self.assertIn('DYNAMIC_RESOLUTION', ctx.capabilities)
+        self.assertIn('RENDER_FLOOR', ctx.capabilities)
         self.assertIn(0xb940460f, words)          # ldr w15, [x16, #0x44]
         self.assertEqual(words.count(0xd65f03c0), 1)
 

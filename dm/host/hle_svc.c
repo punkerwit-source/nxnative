@@ -21,6 +21,7 @@
 #endif
 
 #define SWITCH_ALIAS UINT64_C(0x1000000000)   // a Switch's alias region: 64 GB
+static uint64_t app_pool_bytes(void);   // the profile's app_pool, or DM_APP_POOL (defined with APP_POOL)
 // Reserve one whole block of guest address space, partitioned the Horizon way (address values are the real addresses returned by the host's mmap).
 // It only takes address space, not memory.
 // Size 5 GB: the game needs the first 1 GB (alias region, stacks) + one whole heap block (application memory pool of 3285 MiB, see APP_POOL below),
@@ -279,7 +280,7 @@ static void mem_tight_log(void) {
     if (force && *force) LOG("[mem] tight memory: DM_MEM_TIGHT=%s", force);
     else if (room) LOG("[mem] tight memory: %.2f GB to the memory limit, under 9", room / G);
     else LOG("[mem] tight memory: %.2f GB of physical RAM, under 9", phys / G);
-    LOG("[mem] tight memory: the system already holds about 2 GB of this 8 GB, so speculative GPU textures cap at 1536 MB (DM_GPU_BUDGET), recycled heaps are trimmed (DM_GPU_PURGE), the pipeline archive maps at most 256 MB (DM_PSO_ARCHIVE_MAX), and Ocarina of Time stays at about 0.67 of full size unless DM_RENDER_SCALE is set. DM_MEM_TIGHT=0 keeps the ordinary limits");
+    LOG("[mem] tight memory: the system already holds about 2 GB of this 8 GB, so speculative GPU textures cap at 1536 MB (DM_GPU_BUDGET), recycled heaps are trimmed (DM_GPU_PURGE), large guest pools stay in chunks (DM_NVN_POOL_CHUNK_MIN, DM_NVN_POOL_FULL=0), and the pipeline archive keeps the newest 256 MB and deletes older files (DM_PSO_ARCHIVE_MAX). The render scale line says what Ocarina actually uses. DM_MEM_TIGHT=0 keeps the ordinary limits");
     if (!g_gf_n) LOG("[mem] tight memory: the guest stays anonymous where it can be swapped (DM_GUEST_FILE=1 puts it in files)");
 }
 static void guest_file_init(void) {
@@ -287,10 +288,10 @@ static void guest_file_init(void) {
     uint64_t room = 0;
 #if TARGET_OS_IPHONE
     room = os_proc_available_memory();
-    int want = guest_file_wanted(e, DM_GAME_APP_POOL, room);
-    LOG("[mem] guest memory: memory pool %.2f GB, room to the memory limit %.2f GB, DM_GUEST_FILE %s: %s", DM_GAME_APP_POOL / G, room / G, e && *e ? e : "unset", want ? "in files" : "anonymous");
+    int want = guest_file_wanted(e, app_pool_bytes(), room);
+    LOG("[mem] guest memory: memory pool %.2f GB, room to the memory limit %.2f GB, DM_GUEST_FILE %s: %s", app_pool_bytes() / G, room / G, e && *e ? e : "unset", want ? "in files" : "anonymous");
 #else
-    int want = guest_file_wanted(e, DM_GAME_APP_POOL, 0);
+    int want = guest_file_wanted(e, app_pool_bytes(), 0);
 #endif
     if (!want) return;
     g_gf_min_free = mf && *mf ? env_size("DM_GUEST_FILE_MIN_FREE", 0, 0x100000) : (uint64_t)2 << 30;
@@ -312,8 +313,8 @@ static void guest_file_init(void) {
     LOG("[mem] guest memory: %d files of %.2f GB in %s (unlinked, sparse, shared), %.2f GB in all, on the %s volume, %.1f GB free on it (%.1f with what the system can purge); holes punched where the game gives memory back: %s",
         n, chunk / G, dir, g_reserve / G, fs.f_fstypename, avail / G, imp / G, g_gf_punch ? "on" : "off (DM_GUEST_FILE_PUNCH=0)");
     // The files take up to what the game touches, at most about its memory pool while what it gives back is punched out
-    if (g_gf_min_free && most < DM_GAME_APP_POOL + g_gf_min_free)
-        LOG("[RED] [mem] guest file: the files may take up to the memory pool, %.1f GB, and %.1f GB is free: the game is stopped if under %.1f GB is left", DM_GAME_APP_POOL / G, most / G, g_gf_min_free / G);
+    if (g_gf_min_free && most < app_pool_bytes() + g_gf_min_free)
+        LOG("[RED] [mem] guest file: the files may take up to the memory pool, %.1f GB, and %.1f GB is free: the game is stopped if under %.1f GB is left", app_pool_bytes() / G, most / G, g_gf_min_free / G);
     if (strcmp(fs.f_fstypename, "apfs") || !(fs.f_flags & MNT_LOCAL)) LOG("[RED] [mem] guest file: not on a local APFS volume, where it may not be sparse, or be slow");
     pthread_t th; int rc = pthread_create(&th, NULL, guest_file_thread, NULL);
     if (!rc) pthread_detach(th);
@@ -374,7 +375,17 @@ static void mem_init(void) {
 // and hands the whole block to its own StandardAllocator (main+0x32137a0) -- so heap size = pool − image footprint, it has only as much as the host reports.
 // Previously 3 GB was reported here and SetHeapSize never failed: the heap was about 150 MB smaller than on the real device, at the run entry peak the main heap had only about 18 MB left, and under high local load a timing shift made a 128 KB request return null,
 // which the guest writes to without a null check (CRASH main+0x1b36138, re-verified after merge with inv_tap).
-#define APP_POOL DM_GAME_APP_POOL   // game profile app_pool (Mario 0xCD500000)
+// DM_APP_POOL=<size> reports a smaller pool to the game (SetHeapSize and the alias-map limit). Unset: the profile's pool. Not reduced on a tight device:
+// Ocarina asks for a 6.2 GB heap and then maps alias ranges against the rest of the 9 GB; a pool under what it maps fails with ResultLimitReached. Anonymous memory
+// (DM_GUEST_FILE=0) puts those pages in the footprint, which is what the iPad's files avoid
+static uint64_t app_pool_bytes(void) {
+    static uint64_t v; if (v) return v;
+    const char *e = getenv("DM_APP_POOL"); uint64_t n = e && *e ? dm_env_size(e) : 0;
+    v = n >= ((uint64_t)256 << 20) ? n : DM_GAME_APP_POOL;
+    if (n >= ((uint64_t)256 << 20)) LOG("[mem] application pool %.2f GB (DM_APP_POOL; the profile's is %.2f GB)", v / 1073741824.0, (double)DM_GAME_APP_POOL / 1073741824.0);
+    return v;
+}
+#define APP_POOL (app_pool_bytes())   // game profile app_pool, or DM_APP_POOL
 static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++) if (!g_mod[i].nro) n += g_mod[i].size;   // an NRO lives in memory the game allocated (its image and bss buffers)
     return (n + 0x1fffff) & ~(size_t)0x1fffff; }
 // Giant bss (modules with the patch area before the base, patch_nso.py FAR): the image bytes beyond the file part. Used memory was reported as "heap + 64 MB", where the 64 MB covers ordinary modules' code and data (Mario's two modules are about 74 MB together,

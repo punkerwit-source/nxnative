@@ -288,6 +288,9 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Recycled-heap trim | `DM_GPU_PURGE` | `1`, `0` (unset: on when tight) |
 | Pipeline archive cap | `DM_PSO_ARCHIVE_MAX` | a size (`256M`), or `0` for every file. Unset: `256M` when tight |
 | Guest file advice | `DM_GUEST_FILE_ADVISE` | `1`, `0` (unset: on when tight and the guest is in files) |
+| Pool chunk size | `DM_NVN_POOL_CHUNK_MIN` | a size (unset: `64M` when tight, `512M` otherwise) |
+| Wire a pool whole | `DM_NVN_POOL_FULL` | `1`, `0` (unset: `0` when tight, so only looked-up chunks stay wired) |
+| Application pool | `DM_APP_POOL` | a size (unset: the profile's pool). Not reduced on a tight device |
 | Pipeline prebuild | `DM_PSO_PREBUILD` | `1`, `0` |
 | Encode thread | `DM_NVN_ENC_THREAD` | `1`, `0` |
 | Hold frames when late | `DM_FPS_HOLD` | `on`, `off` |

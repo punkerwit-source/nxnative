@@ -75,6 +75,7 @@ def dynamic_resolution(ctx):
     for w in drs_controller: emit(w)
     fs_put(site, [B(site, start)], 'dynamic resolution level: the render-scale floor (state +0x44, 0 at scale 1), or with state +0x40 (DM_DYNAMIC_RESOLUTION) a climb that stays at or below it')
     ctx.capabilities.add('DYNAMIC_RESOLUTION')
+    ctx.capabilities.add('RENDER_FLOOR')   # the loader logs "render scale:" and writes state +0x44 only when the packed stub is this one
     ctx.render_scale = 1   # DM_RENDER_SCALE 0.5..1.0; the floor level is state +0x44, not a multiply in the view-size function
 
 MATCH_FRAME_STEP = {'main': [
