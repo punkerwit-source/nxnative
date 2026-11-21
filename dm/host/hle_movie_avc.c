@@ -308,6 +308,7 @@ static void avc_bump(mavc *a) {
 
 static void on_frame(void *ref, void *src, OSStatus st, VTDecodeInfoFlags fl, CVImageBufferRef img, CMTime pts, CMTime dur) {
     (void)fl; (void)dur; mavc *a = ref;
+    __atomic_store_n(&a->history.callback_ran, 1, __ATOMIC_RELEASE);
     if (st) { a->history.status = st; return; }
     if (a->history.replaying || !img) return;
     if (a->nq == QMAX) { if (!a->red++) LOG("[RED] movie: AVC reorder queue full, dropping the oldest frame"); CVPixelBufferRelease(a->q[0].pb); memmove(a->q, a->q + 1, --a->nq * sizeof a->q[0]); }

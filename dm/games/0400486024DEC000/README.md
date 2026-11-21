@@ -237,6 +237,7 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 
 ## Found on this game
 
+- [An iOS AV1 picture that arrives after DecodeFrame](../../../docs/reference/movies.md#an-ios-av1-picture-that-arrives-after-decodeframe): the Master Sword cutscene freezes on iPhone and iPad while the Mac plays it. The attached sessions finalized the AV1 decoder after a few hundred packets and no end of stream.
 - [Upload retirement can block Metal 4 feedback](../../../docs/reference/memory.md#upload-retirement-can-block-metal-4-feedback). NX18 reported a freeze on an iPhone 18 Pro Max after loading a save. A synthetic lock stall reproduced the feedback blockage. The cause of the device freeze remains open.
 - [Going to the background while graphics do not drain](../../../docs/reference/nvn-objects.md#going-to-the-background-while-graphics-do-not-drain): NX18's iPhone 18 Pro Max run froze before the background transition. The host now bounds the transition's graphics wait and starts persistence independently. The cause of the initial freeze and the revised iOS behavior are open.
 

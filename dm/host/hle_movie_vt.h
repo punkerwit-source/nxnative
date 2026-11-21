@@ -18,6 +18,7 @@ typedef struct {
     size_t count, capacity;
     int key, replaying;
     OSStatus status;
+    int callback_ran;             // the output callback ran for the DecodeFrame in flight (it may run after DecodeFrame returns)
     movie_vt_control *control;
 } movie_vt_history;
 
@@ -38,10 +39,21 @@ static void movie_vt_remember(movie_vt_history *h, CMSampleBufferRef sample) {
 static OSStatus movie_vt_submit(movie_vt_history *h, VTDecompressionSessionRef session, CMSampleBufferRef sample, void *source) {
     if (h->replaying && !movie_vt_wait(h->control)) return MOVIE_VT_CANCELLED;
     h->status = noErr;
+    __atomic_store_n(&h->callback_ran, 0, __ATOMIC_RELAXED);
     OSStatus status = VTDecompressionSessionDecodeFrame(session, sample, h->replaying ? kVTDecodeFrame_DoNotOutputFrame : 0, source, NULL);
-    // Neither asynchronous nor temporal processing is enabled: the callback's
-    // status is available before DecodeFrame returns (also during replay).
-    return status ? status : h->status;
+    // Hardware AV1 on iOS can run the output callback after DecodeFrame returns. Waiting makes the callback's status and picture visible before the caller
+    // decides the temporal unit produced nothing (a reader with one buffer then waits forever for a sync that never comes).
+    int during = __atomic_load_n(&h->callback_ran, __ATOMIC_ACQUIRE);
+    if (!status) {
+        OSStatus waited = VTDecompressionSessionWaitForAsynchronousFrames(session);
+        if (!h->status && waited) h->status = waited;
+        status = h->status;
+    }
+    if (!during && __atomic_load_n(&h->callback_ran, __ATOMIC_ACQUIRE)) {
+        static int once;
+        if (!once++) LOG("[movie] VideoToolbox delivered a frame after DecodeFrame returned; the host waits for it");
+    }
+    return status;
 }
 static OSStatus movie_vt_create(movie_vt_history *h, CMVideoFormatDescriptionRef format, CFDictionaryRef attributes,
                                 const VTDecompressionOutputCallbackRecord *callback, VTDecompressionSessionRef *session) {

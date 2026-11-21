@@ -59,6 +59,7 @@ typedef struct {
     // The decoder's thread (cv_worker). The codec state above (vpx, avc, av1) is its own from Initialize to Finalize: it decodes outside mu
     pthread_t th; pthread_cond_t work;         // work: a packet was queued, room for pictures came back, a Stop / Flush or Finalize came
     int quit, busy, reopen;                    // busy: the thread decodes a packet; reopen: a Stop / Flush came, so it makes a new codec state before its next packet
+    int saw_eos, spt_note, room_note;          // saw_eos: a picture carried end of stream; the notes cap the first-event and buffer-wait lines
     uint32_t epoch;                            // counts Stop / Flush: the pictures of a packet taken before one are dropped
     struct { uint8_t *data; uint64_t size; int64_t ts; uint8_t eos; } q[CV_HOLD]; uint32_t qhead, qcount;   // the packets taken and not yet decoded, in order (copies)
     cv_times st, all;                          // decode times of the current run of CV_STAT packets and of the runs before it
@@ -93,7 +94,9 @@ static bool sync_reached(const cv_sync *s);
 static void spt_fire(cv_dec *d, uint32_t i) {   // buffer i of d filled: signal the events waiting for it (decoder lock held)
     pthread_mutex_lock(&g_spt_mu);
     for (int k = 0; k < 64; k++) { void *e = g_spt[k]; cv_spt *t = e ? SPT(e) : NULL;
-        if (t && t->want.dec == d->id && t->want.idx == i && d->buf[i].filled_gen >= t->want.gen) { t->armed = 0; g_spt[k] = NULL; hle_signal_system_event(e); } }
+        if (t && t->want.dec == d->id && t->want.idx == i && d->buf[i].filled_gen >= t->want.gen) {
+            if (!d->spt_note++) LOG("[codec] %s decoder %u: first picture event, buffer %u generation %u", k_cv_name[d->codec], d->id, i, d->buf[i].filled_gen);
+            t->armed = 0; g_spt[k] = NULL; hle_signal_system_event(e); } }
     pthread_mutex_unlock(&g_spt_mu);
 }
 static void spt_unarm(void *e) { pthread_mutex_lock(&g_spt_mu); for (int k = 0; k < 64; k++) if (g_spt[k] == e) g_spt[k] = NULL; pthread_mutex_unlock(&g_spt_mu); SPT(e)->armed = 0; }
@@ -131,7 +134,7 @@ static void fill(cv_dec *d, int decoded) {
             dm_movie_picture(d, "nn::codec", ts, 0);   // the frame step follows its rate (hle_movie.c); its times are in ns
             if (decoded) d->st.late++;
         } else { b->w = b->h = 0; b->ts = 0; b->eos = 1; d->eos_pending = 0; }
-        if (b->eos) LOG("[codec] %s decoder %u: end of stream after %llu pictures", k_cv_name[d->codec], d->id, (unsigned long long)d->pictures);
+        if (b->eos) { d->saw_eos = 1; LOG("[codec] %s decoder %u: end of stream after %llu pictures", k_cv_name[d->codec], d->id, (unsigned long long)d->pictures); }
         b->filled = 1; b->filled_gen = b->gen;
         spt_fire(d, i);
     }
@@ -318,6 +321,7 @@ static Result cv_dec_fin(void *t) {
     dm_movie_stopped(d);
     cv_stat_sum(d);
     if (d->all.n) cv_stat_line(d, &d->all, "");
+    if (d->pictures || d->all.n) LOG("[codec] %s decoder %u: finalized after %llu pictures%s", k_cv_name[d->codec], d->id, (unsigned long long)d->pictures, d->saw_eos ? "" : ", no end of stream");
     if (d->codec != CV_H264 && d->codec != CV_AV1 && d->vpx_ok) vpx_codec_destroy(&d->vpx);
     if (d->avc) mavc_free(d->avc);
     if (d->av1) mav1_free(d->av1);
@@ -358,7 +362,10 @@ static Result cv_dec_unreg(void *t, uint32_t i) {   // the buffer leaves the dec
 static Result cv_dec_reset(void *t, int stop) {
     cv_dec *d = cv_of(t); if (!d) return 0;
     dm_host_mutex_lock(&d->mu);
-    if (stop) dm_movie_stopped(d);   // its movie ends now (under the lock fill holds, so no picture of it renews it); a Flush (a seek, a loop) keeps the movie playing
+    if (stop && d->pictures && !d->saw_eos)
+        LOG("[codec] %s decoder %u: stopped after %llu pictures, no end of stream (%u packets not yet decoded, %d pictures not yet in a buffer)", k_cv_name[d->codec], d->id,
+            (unsigned long long)d->pictures, d->qcount, d->nheld);
+    if (stop) { dm_movie_stopped(d); d->saw_eos = 0; }   // its movie ends now (under the lock fill holds, so no picture of it renews it); a Flush (a seek, a loop) keeps the movie playing
     for (uint32_t k = 0; k < d->qcount; k++) free(d->q[(d->qhead + k) % CV_HOLD].data);
     d->qhead = d->qcount = 0;
     for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]);
@@ -407,7 +414,10 @@ static int cv_room(cv_dec *d, cv_out *o) {
     if (d->nheld >= CV_HOLD && !d->quit && o->epoch == d->epoch) {
         uint64_t t0 = now_ns();
         while (d->nheld >= CV_HOLD && !d->quit && o->epoch == d->epoch) pthread_cond_wait(&d->work, &d->mu);
-        o->waited += now_ns() - t0;
+        uint64_t w = now_ns() - t0;
+        o->waited += w;
+        if (w >= 200000000ull && d->room_note < 4) { d->room_note++;
+            LOG("[codec] %s decoder %u: waited %.2f s for the client to release a buffer (%d pictures waiting)", k_cv_name[d->codec], d->id, (double)w / 1e9, d->nheld); }
     }
     return !d->quit && o->epoch == d->epoch;
 }
@@ -689,7 +699,10 @@ HLE_FORCE("_ZN2nn6syncpt3sdk21RequestSyncPointEventEPNS1_18SyncPointEventTypeERK
     SPT(e)->want = *s; SPT(e)->armed = 1;
     pthread_mutex_lock(&g_spt_mu); int k = 0; while (k < 64 && g_spt[k]) k++; if (k < 64) g_spt[k] = e; pthread_mutex_unlock(&g_spt_mu);
     if (k == 64) { LOG("[RED] nn::syncpt: more than 64 armed events: signalled at once"); hle_signal_system_event(e); return 0; }
-    if (sync_reached(s)) { spt_unarm(e); hle_signal_system_event(e); }
+    if (sync_reached(s)) {
+        static int once; if (!once++) LOG("[codec] sync point armed for a picture already in its buffer: signalled at once");
+        spt_unarm(e); hle_signal_system_event(e);
+    }
     return 0;
 }
 HLE_FORCE("_ZN2nn6syncpt3sdk20CancelSyncPointEventEPNS1_18SyncPointEventTypeE", "disarms the event", void, h_spt_cancel, void *e) { spt_unarm(e); hle_clear_system_event(e); }
