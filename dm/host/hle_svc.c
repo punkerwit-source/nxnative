@@ -329,7 +329,7 @@ static void mem_init_once(void) {
     if (as && *as) { alias = (size_t)strtoull(as, NULL, 0); if (alias < 0x10000000 || (alias & (pg - 1))) die("DM_ALIAS_SIZE %s: at least 256 MB, in whole host pages", as); }
     g_reserve = RESERVE - DM_GAME_MEM_ALIAS + alias;
     g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (g_as == MAP_FAILED) die("reserve guest AS");
+    if (g_as == MAP_FAILED) die("reserve guest AS of %.2f GB failed (errno %d). On iOS the increased-memory-limit entitlement is what leaves a free block this large; without it this phone's largest free block was 6 GB and os_proc_available_memory was 3351 MB", g_reserve / 1073741824.0, errno);
     guest_file_init();
     // Fixed partition (all inside the reserved block): 256 MB in front, the heap, the stacks, then the alias region. Mario: a heap region of 1.625 GB, stack 256 MB, alias 2.875 GB.
     // The alias region is last because a Switch's addresses stay below 2^39 and a 64 GB alias region cannot: macOS 27 reserves 0x1000000000-0x7000000000, which leaves exactly 64 GB below
@@ -353,7 +353,6 @@ static void mem_init_once(void) {
         else LOG("[RED] [mem] guest file: no thread to watch it (error %d): no 10-s line, and nothing stops the game when its disk fills", rc);
     }
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p", g_as, (unsigned long long)g_reserve, g_heap, g_alias, g_stack);
-    if (alias < 0x110000000ull) LOG("[mem] alias region %.2f GB. A region the SDK places past 4.16 GB does not fit: AllocateAddressRegion returns 0x1803 and the loader can spin (Ocarina of Time's Chamber of Sages, issue #3103). DM_ALIAS_SIZE=0x118000000 still contains that placement", alias / 1073741824.0);
     if ((uint64_t)(uintptr_t)g_alias > UINT64_C(1) << 39) LOG("[mem] the heap and stacks reach past 2^39, which a Switch's addresses never do: a crash on a cut-off pointer points here (DM_ALIAS_SIZE=<profile's mem_alias> keeps them lower)");
     const char *aw = getenv("DM_ALIAS_WINDOWS");
     if (aw && atoi(aw) > 0) { pthread_t th; if (!pthread_create(&th, NULL, alias_windows_thread, (void *)(uintptr_t)atoi(aw))) pthread_detach(th); }
@@ -750,9 +749,54 @@ static void guest_caller(const uint64_t *r, char *buf, size_t n, uint64_t *via) 
     if (m) snprintf(buf, n, "%s+%#llx", m->name, (unsigned long long)(lr - (uint64_t)(uintptr_t)m->base));
     else snprintf(buf, n, "%#llx", (unsigned long long)lr);
 }
+static int region_off_cmp(const void *a, const void *b) {
+    uint64_t x = ((const region_t *)a)->off, y = ((const region_t *)b)->off;
+    return (x > y) - (x < y);
+}
+// Largest gap between live address regions. MapPhysicalMemory's high water does not drop when pages are unmapped, so a high water at the cap with few bytes mapped is either a hole
+// (a freed region, which VammManager's first-fit search reuses) or uncommitted pages inside a region the game still holds. out names the hole and the three largest regions.
+uint64_t mem_alias_hole(char *out, size_t n) {
+    if (!out || !n) return 0;
+    if (!g_alias) { snprintf(out, n, "alias region not ready"); return 0; }
+    pthread_mutex_lock(&g_rgn_lock);
+    int nr = g_nrgn;
+    region_t *t = nr ? malloc(sizeof *t * (size_t)nr) : NULL;
+    if (nr && !t) { pthread_mutex_unlock(&g_rgn_lock); snprintf(out, n, "region table: out of memory"); return 0; }
+    if (t) memcpy(t, g_rgn, sizeof *t * (size_t)nr);
+    pthread_mutex_unlock(&g_rgn_lock);
+    if (nr) qsort(t, (size_t)nr, sizeof *t, region_off_cmp);
+    uint64_t sum = 0, cursor = 0, hole = 0, hat = 0;
+    int top[3] = {-1, -1, -1};
+    for (int i = 0; i < nr; i++) {
+        uint64_t off = t[i].off, end = off + t[i].size;
+        if (off > g_alias_cap) off = g_alias_cap;
+        if (end > g_alias_cap) end = g_alias_cap;
+        if (off > cursor && off - cursor > hole) { hole = off - cursor; hat = cursor; }
+        if (end > cursor) cursor = end;
+        sum += t[i].size;
+        for (int k = 0; k < 3; k++) if (top[k] < 0 || t[i].size > t[top[k]].size) {
+            for (int j = 2; j > k; j--) top[j] = top[j - 1];
+            top[k] = i; break;
+        }
+    }
+    if (g_alias_cap > cursor && g_alias_cap - cursor > hole) { hole = g_alias_cap - cursor; hat = cursor; }
+    size_t o = (size_t)snprintf(out, n, "%d live regions, %.2f GB reserved, largest free hole %.1f MB at +%.2f GB", nr, sum / 1073741824.0, hole / 1048576.0, hat / 1073741824.0);
+    for (int k = 0; k < 3 && top[k] >= 0 && o < n; k++)
+        o += (size_t)snprintf(out + o, n - o, "%s %.0f MB at +%.2f GB (%s)", k ? ";" : "; biggest", t[top[k]].size / 1048576.0, t[top[k]].off / 1073741824.0, t[top[k]].who);
+    free(t);
+    return hole;
+}
 static void region_ask(uint64_t *r, int param) {
     (void)param;
     t_rgn_size = r[2]; guest_caller(r, t_rgn_who, sizeof t_rgn_who, &t_rgn_via);
+    if (r[2] < 0x2000000) return;   // 32 MB and up: a bank swap. Smaller regions are the steady traffic
+    char fit[700]; uint64_t hole = mem_alias_hole(fit, sizeof fit);
+    if (hole < r[2]) {
+        static int lines;
+        if (lines < 20) { lines++;
+            LOG("[mem] address region %.2f MB for %s does not fit. %s. VammManager searches first-fit and reuses a region FreeAddressRegion gave back; a hole smaller than the request is space a live region still owns",
+                r[2] / 1048576.0, t_rgn_who, fit); }
+    }
 }
 static void region_got(uint64_t *r, int param) {
     mem_init();

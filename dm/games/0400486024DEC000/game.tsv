@@ -24,8 +24,9 @@ zip_store	.zs:.bwav:.webm:.metallib
 
 # ---- Memory ----
 # The Switch 2 leaves games 9 GB of its 12 GB (Donkey Kong Bananza's figure). The NPDM declares 48 MB of system resource, so virtual address memory is on.
-# 256 MiB in front + 8 GiB heap + 256 MiB stacks + 5 GiB alias region. At 4 GiB the Chamber of Sages transition cannot place a 50.03 MiB
-# region at alias +0x10aa00000 (#3103); that placement ends near +4.21 GiB. On an iPhone 17 Pro, host 073e3700 with DM_ALIAS_SIZE=0x140000000
+# 256 MiB in front + 8 GiB heap + 256 MiB stacks + 5 GiB alias region. 4 GiB and 4.375 GiB both fail the Master Sword
+# bank: at 4.375 GiB the address space was full at +4.37 GB with 2.61 GB mapped (#3103). 5 GiB places the bank.
+# On an iPhone 17 Pro, host 073e3700 with DM_ALIAS_SIZE=0x140000000
 # (this 5 GiB layout, guest AS +0x360000000) GPU allocated still reached about 7.1 GB and the app was killed. The Mac reserves 64 GB (hle_svc.c).
 mem_reserve	0x360000000
 mem_alias	0x140000000

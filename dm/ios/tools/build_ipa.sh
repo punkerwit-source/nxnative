@@ -8,7 +8,7 @@
 #   DM_COPY_ROMFS=NO leaves the game files (RomFS) out of the IPA, as it does for the Xcode build phase: the package then stays small (a large game's full package can exceed what iOS extracts), and the app takes the files from Documents/romfs.img (scripts/push_romfs.sh); default: they are packed
 #   DM_SHADER_FILES=1 packs an NVN game's shader library as its separate files, msl/b-<chain>/, not as the one file b-<chain>.img, for install tools that cannot copy a large file (AltServer; pack_ipa.py --shader-files); default: off
 #   DM_ENTITLEMENTS=<plist> is the unsigned IPA's entitlements, signed ad-hoc into the executable (relative to the caller's directory; default: an empty dict, which a free Personal Team can sign; an empty string = no entitlements file)
-#   DM_IOS_MEMORY_ENTITLEMENTS=1 asks for Increased Memory Limit and Extended Virtual Addressing. A paid Developer Program team can provision those only after they are enabled on the App ID. A free Personal Team cannot, and Xcode automatic signing then fails.
+#   DM_IOS_MEMORY_ENTITLEMENTS=1 also asks for Extended Virtual Addressing. The default file asks only for Increased Memory Limit, which a free Personal Team (automatic signing) does sign. Extended Virtual Addressing stays opt-in: a free team cannot provision it, and it does not raise the jetsam limit.
 #   AOC=add-on content directory (default $W/data/aoc; when it exists it goes to DmIOS.app/aoc/<index>/; an empty string = none), GFXAPI=nvn / vulkan (default: by the shader libraries in MSL_IOS)
 #   The app name is the game name in the base NSP's control data ($W/data/v0/control.nacp, else the one next to the RomFS), the app version is the display version in the packed game's control data (the one next to the RomFS:
 #   nx_extract saves the update's there when an update is packed, else the base game's), the bundle ID is org.nxnative.<base game title ID in lowercase> (DM_DISPLAY_NAME / DM_APP_VERSION / DM_BUNDLE_ID override them);
@@ -31,14 +31,14 @@ esac
 cd "$(dirname "$0")/.." || exit 1
 IOS_SOURCE=$PWD; IOS=$PWD; DM=$(cd .. && pwd)
 t() { echo "[$(date +%T)] $*"; }; die() { t "FAIL: $*"; exit 1; }
-# Empty dict unless DM_IOS_MEMORY_ENTITLEMENTS=1. A free Personal Team cannot provision the memory keys; a paid team opts in.
+# Increased Memory Limit by default. A free Personal Team signs that key with automatic signing; without it this phone reported 3351 MB and the guest reservation failed. DM_IOS_MEMORY_ENTITLEMENTS=1 adds Extended Virtual Addressing, which a free team cannot provision.
 write_entitlements() { # $1 destination
   if [ "${DM_IOS_MEMORY_ENTITLEMENTS:-0}" = 1 ]; then
     printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
       '<plist version="1.0"><dict><key>com.apple.developer.kernel.increased-memory-limit</key><true/><key>com.apple.developer.kernel.extended-virtual-addressing</key><true/></dict></plist>' > "$1" || die "entitlements"
   else
     printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-      '<plist version="1.0"><dict></dict></plist>' > "$1" || die "entitlements"
+      '<plist version="1.0"><dict><key>com.apple.developer.kernel.increased-memory-limit</key><true/></dict></plist>' > "$1" || die "entitlements"
   fi
 }
 [ -n "${GAME:-}" ] || die "GAME is not set: GAME=<base game title ID> $0; profiles: $(python3 "$DM/games/game.py" list | awk -F'\t' '{printf "%s (%s)  ", $1, $3}')"
@@ -207,7 +207,7 @@ if [ -f "$ICON" ]; then
   echo "DM_APPICON = AppIcon" >> Gen/dm.xcconfig
   t "app icon: $ICON"
 else t "no app icon ($ICON not found): the home-screen icon stays blank"; fi
-# A prepared Xcode project is signed in Xcode. The default entitlements file is empty: a free Personal Team cannot provision Increased Memory Limit or Extended Virtual Addressing, and leaving either key in makes automatic signing fail. DM_IOS_MEMORY_ENTITLEMENTS=1 writes both, for a paid team that has enabled them on the App ID. DM_ENTITLEMENTS=another plist, or empty for no file.
+# A prepared Xcode project is signed in Xcode. The default entitlements file asks for Increased Memory Limit, which a free Personal Team signs. DM_IOS_MEMORY_ENTITLEMENTS=1 also writes Extended Virtual Addressing, for a paid team that has enabled it on the App ID. DM_ENTITLEMENTS=another plist, or empty for no file.
 # The unsigned IPA carries the same plist in its executable's ad-hoc signature below; the install tool replaces that signature.
 if [ "$PREPARE_XCODE" = YES ] && [ -n "${DM_ENTITLEMENTS-default}" ]; then
   if [ -n "${DM_ENTITLEMENTS:-}" ]; then cp "$DM_ENTITLEMENTS" Gen/DmIOS.entitlements || die "copy DM_ENTITLEMENTS"

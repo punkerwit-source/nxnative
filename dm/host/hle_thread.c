@@ -1046,6 +1046,7 @@ void dm_yield_top(char *out, size_t n) {
 }
 // Tests that compile this file without hle_svc.c get zeros. The host's definition in hle_svc.c replaces this one.
 __attribute__((weak)) void mem_alias_use(uint64_t *cap, uint64_t *mapped, uint64_t *hw) { if (cap) *cap = 0; if (mapped) *mapped = 0; if (hw) *hw = 0; }
+__attribute__((weak)) uint64_t mem_alias_hole(char *out, size_t n) { if (out && n) snprintf(out, n, "no region table"); return 0; }
 // CPU time of the guest threads since the last call, by Switch priority band (<= 44: the main thread's level and above; 45-59; >= 60) and the three busiest threads with their priority.
 // For the power line (hle_nvn.c power_line): it shows which threads a priority-to-QoS mapping would move and how much CPU they use. secs = the window length
 void dm_thread_cpu(char *out, size_t n, double secs) {
@@ -1079,6 +1080,7 @@ void dm_thread_cpu(char *out, size_t n, double secs) {
             LOG("[thr] guest thread %#x '%s' priority %d has used %.0f ms/s for %.1f s (wait kind %d, last SVC %#x at %s+%#llx). Alias region %.2f GB, mapped %.2f GB, high water +%.2f GB. PC and backtrace follow",
                 hot_h, hot_name, hot_prio, d[0], secs, hot_kind, hot_svc, lm ? lm->name : "?", lm ? hot_lr - (uint64_t)lm->base : hot_lr,
                 cap / 1073741824.0, mapped / 1073741824.0, hw / 1073741824.0);
+            char fit[700]; mem_alias_hole(fit, sizeof fit); LOG("[thr] alias free: %s", fit);
             thr_bt(hot);
         }
     }

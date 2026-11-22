@@ -16,7 +16,7 @@ XCODE = SCRIPT[SCRIPT.index('# A prepared Xcode project is signed'):SCRIPT.index
 SIGNING = SCRIPT[SCRIPT.index('# The entitlements of an unsigned IPA'):SCRIPT.index('\nP=Payload/DmIOS.app\n')]
 CAN_SIGN = sys.platform == 'darwin' and shutil.which('codesign') and shutil.which('cc')
 CUSTOM = {'com.apple.developer.kernel.extended-virtual-addressing': True}
-DEFAULT = {}
+DEFAULT = {'com.apple.developer.kernel.increased-memory-limit': True}
 PAID = {'com.apple.developer.kernel.increased-memory-limit': True,
         'com.apple.developer.kernel.extended-virtual-addressing': True}
 
