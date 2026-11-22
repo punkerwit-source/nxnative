@@ -117,6 +117,9 @@ own_alias_stats own_alias_stats_locked(void);
 // longest any of them has gone without a lookup, in submissions (issue #2629: how much of a long session's memory growth they are). A walk: the memory report
 typedef struct { uint32_t entries; uint64_t bytes, writable_bytes, oldest_idle; } own_alias_unheld;
 own_alias_unheld own_alias_unheld_locked(void);
+// Drop sharing-table entries nothing holds (no live or ghost serial, no pin) whose last lookup is at least idle_subs ago. A lookup stamp of 0 stays.
+// max_n at most. Each texture is retired through the deferred-release queue (alias_del). *nout is how many entries went (NULL skips the count). → allocatedSize released, each texture once. Caller holds g_smu
+uint64_t own_alias_idle_drop_locked(uint64_t idle_subs, uint32_t max_n, uint32_t *nout);
 
 // Retirement eligibility (see above). Caller holds g_smu
 int own_retire_locked(id o);    // a retired resource whose fence has passed: 1, it may leave the residency set; 0, an entry holds it: the owner keeps it (the caller drops only its reference)

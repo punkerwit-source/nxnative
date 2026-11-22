@@ -604,6 +604,33 @@ own_alias_unheld own_alias_unheld_locked(void) {
     }
     CFRelease(sized); return s;
 }
+uint64_t own_alias_idle_drop_locked(uint64_t idle_subs, uint32_t max_n, uint32_t *nout) {
+    if (nout) *nout = 0;
+    if (!g_alias.n || !max_n) return 0;
+    uint64_t now = own_hook_submission();
+    alias_key *vk = NULL; uint32_t nv = 0, cap = 0;
+    for (uint32_t i = 0; i < g_alias.cap && nv < max_n; i++) {
+        void *v = g_alias.vals[i]; if (!v || entry_holds(v) || tex_object_pinned((__bridge id)v)) continue;
+        alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+        uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, &k);
+        if (!seen || now < seen || now - seen < idle_subs) continue;
+        if (nv == cap) { cap = cap ? cap * 2 : 64; alias_key *n = realloc(vk, cap * sizeof *vk); if (!n) ODIE("the idle shared textures"); vk = n; }
+        vk[nv++] = k;
+    }
+    CFMutableSetRef sized = CFSetCreateMutable(NULL, 0, NULL);
+    uint64_t bytes = 0;
+    for (uint32_t j = 0; j < nv; j++) {
+        id o = hm_get_id(&g_alias, &vk[j]);
+        if (!o || CFSetContainsValue(sized, (__bridge const void *)o) || ![o respondsToSelector:@selector(allocatedSize)]) continue;
+        CFSetAddValue(sized, (__bridge const void *)o);
+        bytes += ((id<MTLResource>)o).allocatedSize;
+    }
+    for (uint32_t j = 0; j < nv; j++) alias_del(&vk[j]);
+    CFRelease(sized); free(vk);
+    if (nv) own_epoch();
+    if (nout) *nout = nv;
+    return bytes;
+}
 own_stats own_stats_locked(void) { return (own_stats){.live = g_by_serial.n, .live_cap = g_by_serial.cap, .ghost = g_ghost.n, .retire_wait = g_retire_wait.n, .ghost_puts = g_ghost_puts}; }
 void own_each_locked(void (^fn)(uint64_t serial, id o, int ghost)) {
     const nvn_hmap *tables[] = {&g_by_serial, &g_ghost};

@@ -584,19 +584,54 @@ static void tu_register(id<MTLTexture> t, uint64_t serial) {
     if (g_tu_gone.n && nvn_hm_del(&g_tu_gone, &serial)) g_tu_remade++;
     os_unfair_lock_unlock(&g_tu_lk);
 }
-// When a submission begins: heaps that waited RH_IDLE_NS, and the oldest past RH_CAP bytes, leave the residency set and are freed
-static void rh_trim(void) {
-    if (!g_rh_n) return;
+// When a submission begins: heaps that waited RH_IDLE_NS, and the oldest past RH_CAP bytes, leave the residency set and are freed.
+// force drops the oldest waiting heaps even inside that window (the iOS cap, ios_gpu_pressure). At most 64 a call
+static unsigned rh_trim(int force) {
+    if (!g_rh_n) return 0;
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC); void *drop[64]; unsigned nd = 0;
     os_unfair_lock_lock(&g_rh_lk);
     while (g_rh_n && nd < 64) {
         unsigned old = 0; for (unsigned i = 1; i < g_rh_n; i++) if (g_rh[i].t < g_rh[old].t) old = i;
-        if (now - g_rh[old].t < RH_IDLE_NS && g_rh_bytes <= RH_CAP) break;
+        if (!force && now - g_rh[old].t < RH_IDLE_NS && g_rh_bytes <= RH_CAP) break;
         drop[nd++] = g_rh[old].heap; g_rh_bytes -= g_rh[old].size; g_rh[old] = g_rh[--g_rh_n];
     }
     os_unfair_lock_unlock(&g_rh_lk);
     for (unsigned i = 0; i < nd; i++) { id<MTLHeap> h = CFBridgingRelease(drop[i]); res_remove(h); }
     if (nd) atomic_fetch_add(&g_rh_trimmed, nd);
+    return nd;
+}
+// iOS jetsam kills the process with no log once phys_footprint nears the phone's limit. Past the cap, drop GPU copies nothing names any more:
+// sharing-table textures with no serial or pin, idle for a couple of seconds of submissions, and render-target heaps waiting to be reused.
+// Live textures the game still holds stay. DM_NVN_IOS_GPU_CAP_MB (default 4600) is currentAllocatedSize; DM_NVN_IOS_HEADROOM_MB (default 1536)
+// is os_proc_available_memory. Either at 0 turns that half off; both at 0 turns the pass off. The Mac has no jetsam limit of this kind
+static void ios_gpu_pressure(void) {
+#if TARGET_OS_IPHONE
+    static int cap = -2, room = -2;
+    if (cap == -2) {
+        const char *e = getenv("DM_NVN_IOS_GPU_CAP_MB"), *r = getenv("DM_NVN_IOS_HEADROOM_MB");
+        cap = e && *e ? atoi(e) : 4600;
+        room = r && *r ? atoi(r) : 1536;
+    }
+    if (cap <= 0 && room <= 0) return;
+    static uint64_t last_ns;
+    uint64_t ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    if (last_ns && ns - last_ns < 1000000000ull) return;
+    last_ns = ns;
+    uint64_t gpu = g_dev.currentAllocatedSize;
+    size_t avail = os_proc_available_memory();
+    if (!((cap > 0 && gpu >= (uint64_t)cap << 20) || (room > 0 && avail < (size_t)room << 20))) return;
+    unsigned heaps = 0, n;
+    for (int i = 0; i < 32 && (n = rh_trim(1)); i++) heaps += n;
+    uint32_t ntex = 0;
+    pthread_mutex_lock(&g_smu);
+    uint64_t bytes = own_alias_idle_drop_locked(2000, 512, &ntex);
+    pthread_mutex_unlock(&g_smu);
+    for (int i = 0; i < 32 && (n = rh_trim(1)); i++) heaps += n;
+    static int lines;
+    if (lines < 40 && (ntex || heaps || lines < 3)) { lines++;
+        MLOG("iOS memory cap: GPU allocated %llu MB, headroom %llu MB (cap %d MB, headroom floor %d MB): released %u idle shared textures (%llu MB) and %u waiting render-target heaps",
+             (unsigned long long)(gpu >> 20), (unsigned long long)(avail >> 20), cap, room, ntex, (unsigned long long)(bytes >> 20), heaps); }
+#endif
 }
 // The R32 storage under a 32-bit colour texture that takes image atomics (tex_upgrade): resident as long as the colour view over it lives, which is what the game's names hold
 @interface NvAtomicRaw : NSObject { @public id<MTLTexture> raw; } @end
@@ -1731,8 +1766,9 @@ void mtl_sub_begin(void) {
     if (g_pkg_kept) { g_pkg_kept = 0; nvn_dirty_touch(); } seg_clk_put(g_sclk); g_sclk = NULL;
     sub_cut_begin();
     defer_drain();
-    rh_trim();
+    rh_trim(0);
     tu_tick();   // the render targets drawn over since their last use go, once a second
+    ios_gpu_pressure();
     mtl_prepare();   // done by then in the submit entry; the replay tool (nvn_replay) reaches it here
     warm_claim();
     if (g_cb) MDIE("submit re-entered");
