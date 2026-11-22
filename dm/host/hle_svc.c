@@ -353,6 +353,7 @@ static void mem_init_once(void) {
         else LOG("[RED] [mem] guest file: no thread to watch it (error %d): no 10-s line, and nothing stops the game when its disk fills", rc);
     }
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p", g_as, (unsigned long long)g_reserve, g_heap, g_alias, g_stack);
+    if (alias < 0x110000000ull) LOG("[mem] alias region %.2f GB. A region the SDK places past 4.16 GB does not fit: AllocateAddressRegion returns 0x1803 and the loader can spin (Ocarina of Time's Chamber of Sages, issue #3103). DM_ALIAS_SIZE=0x118000000 still contains that placement", alias / 1073741824.0);
     if ((uint64_t)(uintptr_t)g_alias > UINT64_C(1) << 39) LOG("[mem] the heap and stacks reach past 2^39, which a Switch's addresses never do: a crash on a cut-off pointer points here (DM_ALIAS_SIZE=<profile's mem_alias> keeps them lower)");
     const char *aw = getenv("DM_ALIAS_WINDOWS");
     if (aw && atoi(aw) > 0) { pthread_t th; if (!pthread_create(&th, NULL, alias_windows_thread, (void *)(uintptr_t)atoi(aw))) pthread_detach(th); }
@@ -385,6 +386,7 @@ static uint64_t used_beside_heap(void) { return (uint64_t)DM_GAME_MEM_USED + big
 // For memory accounting (memstat.m): the range of the whole guest address space block (base = NULL when not initialized)
 void svc_guest_range(uint8_t **base, size_t *size) { *base = g_as; *size = g_reserve; }
 void svc_alias_range(uint8_t **base, size_t *size) { *base = g_alias; *size = g_alias_cap; }   // the alias region (GetInfo's), NULL before mem_init
+void mem_alias_use(uint64_t *cap, uint64_t *mapped, uint64_t *hw) { if (cap) *cap = g_alias_cap; if (mapped) *mapped = (uint64_t)atomic_load(&g_alias_mapped); if (hw) *hw = atomic_load(&g_alias_hw); }
 
 enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=4, I_HeapSize=5,
        I_TotalMem=6, I_UsedMem=7, I_DebuggerAttached=8, I_ResourceLimit=9, I_IdleTick=10, I_RandomEntropy=11,

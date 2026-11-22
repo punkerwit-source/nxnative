@@ -601,17 +601,20 @@ static unsigned rh_trim(int force) {
     return nd;
 }
 static _Atomic int g_tu_idle_ds;   // tu_pass's idle, in deciseconds, while the iOS cap is hot; 0 keeps TU_IDLE
+#if TARGET_OS_IPHONE
+static void up_pressure_release(void);
+#endif
 // iOS jetsam kills the process with no log once phys_footprint nears the phone's limit. Past the cap, drop GPU copies nothing names any more:
 // sharing-table textures with no serial or pin, idle for a couple of seconds of submissions, and render-target heaps waiting to be reused.
-// Live textures the game still holds stay. DM_NVN_IOS_GPU_CAP_MB (default 4600) is currentAllocatedSize; DM_NVN_IOS_HEADROOM_MB (default 1536)
-// is os_proc_available_memory. Either at 0 turns that half off; both at 0 turns the pass off. The Mac has no jetsam limit of this kind
+// Live textures the game still names stay. DM_NVN_IOS_GPU_CAP_MB is an optional currentAllocatedSize cap (default 0: off). DM_NVN_IOS_HEADROOM_MB
+// (default 1024) is the os_proc_available_memory floor: a free Personal Team has no increased-memory entitlement, so the real jetsam limit is whatever that call reports and the host stays 1 GB under it. Either at 0 turns that half off; both at 0 turns the pass off. The Mac has no jetsam limit of this kind
 static void ios_gpu_pressure(void) {
 #if TARGET_OS_IPHONE
     static int cap = -2, room = -2;
     if (cap == -2) {
         const char *e = getenv("DM_NVN_IOS_GPU_CAP_MB"), *r = getenv("DM_NVN_IOS_HEADROOM_MB");
-        cap = e && *e ? atoi(e) : 4600;
-        room = r && *r ? atoi(r) : 1536;
+        cap = e && *e ? atoi(e) : 0;
+        room = r && *r ? atoi(r) : 1024;
     }
     if (cap <= 0 && room <= 0) return;
     static uint64_t last_ns;
@@ -628,6 +631,7 @@ static void ios_gpu_pressure(void) {
     uint64_t bytes = own_alias_idle_drop_locked(200, 512, &ntex);
     pthread_mutex_unlock(&g_smu);
     atomic_store(&g_tu_idle_ds, 5);   // drawn-over render targets go after 0.5 s while the cap is hot (tu_pass); 3 s otherwise
+    up_pressure_release();
     for (int i = 0; i < 32 && (n = rh_trim(1)); i++) heaps += n;
     static int lines;
     if (lines < 40 && (ntex || heaps || lines < 3)) { lines++;
@@ -3508,6 +3512,9 @@ static uint64_t up_idle_period(void) {
         g_up_idle_report = e && *e;
         char *end;
         int64_t ms = g_up_idle_report ? strtoll(e, &end, 10) : 0;
+#if TARGET_OS_IPHONE
+        if (!g_up_idle_report) { ms = 500; end = ""; g_up_idle_report = 1; }   // a free-team jetsam limit has no room for idle 32 MB staging blocks. DM_NVN_UPLOAD_IDLE_MS=0 keeps them
+#endif
         ns = ms > 0 && ms <= INT64_MAX / 1000000 && !*end ? ms * 1000000 : 0;
     }
     return (uint64_t)ns;
@@ -3562,6 +3569,17 @@ static void up_idle_release(void) {
              (unsigned long long)g_up_blocks_new, (unsigned long long)g_up_idle_n, (unsigned long long)(g_up_idle_bytes >> 20));
     }
 }
+#if TARGET_OS_IPHONE
+static void up_pressure_release(void) {   // drop completed upload blocks at once when the jetsam headroom is low. A slot whose batch is still on the GPU stays
+    if (g_up_cb) return;
+    uint64_t before = g_up_idle_n;
+    for (unsigned s = 0; s < 3; s++) {
+        if (atomic_load(&g_up_alloc_busy[s])) continue;
+        up_idle_drop(&g_up_slot_blk[s]); up_idle_drop(&g_up_slot_over[s]); g_up_slot_want[s] = 0;
+    }
+    if (g_up_idle_n != before) res_commit();
+}
+#endif
 typedef struct {
     __unsafe_unretained id<MTLBuffer> src;
     size_t off, row, image;
@@ -10109,7 +10127,12 @@ static id<MTL4Archive> arch_open(NSString *path, NSError **err) {
     arch_reads rd = {0};
     if (!arch_file_check(path, &rd)) return nil;
     int fd = open(path.fileSystemRepresentation, O_RDONLY);
-    if (fd >= 0) {
+    // On iOS the bundled archive is several GB. MADV_WILLNEED faults its libraries into the file cache at open, and that cache is charged toward jetsam. Metal still maps the file and reads a page when a pipeline is taken. DM_PSO_PREFAULT=1 restores the eager read.
+    int prefault = 1;
+#if TARGET_OS_IPHONE
+    { const char *pf = getenv("DM_PSO_PREFAULT"); prefault = pf && atoi(pf) > 0; }
+#endif
+    if (fd >= 0 && prefault) {
         enum { CH = 8 << 20 }; size_t first[65] = {0}, *fp = first; const arch_reads *r = &rd;   // first[i]: the first 8 MB piece of range i
         for (int i = 0; i < rd.n; i++) first[i + 1] = first[i] + (rd.len[i] + CH - 1) / CH;
         dispatch_apply(first[rd.n], dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t k) {
@@ -10119,8 +10142,8 @@ static id<MTL4Archive> arch_open(NSString *path, NSError **err) {
             void *w = mmap(NULL, ml, PROT_READ, MAP_SHARED, fd, (off_t)a0);
             if (w != MAP_FAILED) { (void)madvise(w, ml, MADV_WILLNEED); munmap(w, ml); }
         });
-        close(fd);
     }
+    if (fd >= 0) close(fd);
     return [g_dev newArchiveWithURL:[NSURL fileURLWithPath:path] error:err];
 }
 // Snapshot every source before admission and use that same set for the opens, including the parallel device opens. Files another run publishes later wait until next start.
@@ -12350,7 +12373,20 @@ enum { POOL_FRAME_BYTES = 32u << 20, POOL_REQ_BYTES = 128u << 20, POOL_SUB_MS = 
 static uint64_t g_walk_frame = ~0ull, g_walk_spent, g_walk_sub = ~0ull; static double g_walk_ms; static int g_walk_over;
 static uint64_t pool_tex_size(const tex_t *t) { return t->L.size ? t->L.size : 1; }
 static int pool_size_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
-static uint64_t pool_budget(void) { return g_dev.recommendedMaxWorkingSetSize / 20; }
+static uint64_t pool_budget(void) {
+    uint64_t cap = g_dev.recommendedMaxWorkingSetSize / 20;
+#if TARGET_OS_IPHONE
+    // Leave DM_NVN_IOS_HEADROOM_MB (default 1 GB) before jetsam. Once the process is inside that margin, the walk makes no more optional textures.
+    static int floor_mb = -2;
+    if (floor_mb == -2) { const char *e = getenv("DM_NVN_IOS_HEADROOM_MB"); floor_mb = e && *e ? atoi(e) : 1024; }
+    if (floor_mb > 0) {
+        uint64_t avail = os_proc_available_memory(), floor = (uint64_t)floor_mb << 20;
+        if (avail <= floor) return g_dev.currentAllocatedSize;
+        if (avail - floor < cap) cap = avail - floor;
+    }
+#endif
+    return cap;
+}
 static uint64_t g_walk_req;
 // A render target no pass has written holds nothing to read, and a pass makes its texture when it renders. Made for a read, one that only registers next frame's target took three times the
 // textures and 17 GB allocated on Ocarina of Time: the game re-registers its IDs with transient targets, whose IDs a shader read as the previous texture

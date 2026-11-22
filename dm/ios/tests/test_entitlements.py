@@ -16,8 +16,9 @@ XCODE = SCRIPT[SCRIPT.index('# A prepared Xcode project is signed'):SCRIPT.index
 SIGNING = SCRIPT[SCRIPT.index('# The entitlements of an unsigned IPA'):SCRIPT.index('\nP=Payload/DmIOS.app\n')]
 CAN_SIGN = sys.platform == 'darwin' and shutil.which('codesign') and shutil.which('cc')
 CUSTOM = {'com.apple.developer.kernel.extended-virtual-addressing': True}
-DEFAULT = {'com.apple.developer.kernel.increased-memory-limit': True,
-           'com.apple.developer.kernel.extended-virtual-addressing': True}
+DEFAULT = {}
+PAID = {'com.apple.developer.kernel.increased-memory-limit': True,
+        'com.apple.developer.kernel.extended-virtual-addressing': True}
 
 
 class EntitlementsTests(unittest.TestCase):
@@ -49,6 +50,8 @@ class EntitlementsTests(unittest.TestCase):
                 env['DM_ENTITLEMENTS'] = str(custom)
             elif kind == 'empty':
                 env['DM_ENTITLEMENTS'] = ''
+            elif kind == 'paid':
+                env['DM_IOS_MEMORY_ENTITLEMENTS'] = '1'
             elif kind == 'missing':
                 custom.unlink()
                 env['DM_ENTITLEMENTS'] = custom.name
@@ -66,7 +69,7 @@ class EntitlementsTests(unittest.TestCase):
                 return
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             entitlements = (project / 'Gen' if prepare else package) / 'DmIOS.entitlements'
-            expected = None if kind == 'empty' else DEFAULT if kind == 'unset' else CUSTOM
+            expected = None if kind == 'empty' else DEFAULT if kind == 'unset' else PAID if kind == 'paid' else CUSTOM
             self.assertEqual(entitlements.exists(), expected is not None)
             if expected is not None:
                 self.assertEqual(plistlib.loads(entitlements.read_bytes()), expected)
@@ -81,7 +84,7 @@ class EntitlementsTests(unittest.TestCase):
                 self.assertEqual(actual, expected)
 
     def test_prepared_project_entitlements(self):
-        for kind in ('relative', 'dotdot', 'absolute', 'unset', 'empty', 'missing'):
+        for kind in ('relative', 'dotdot', 'absolute', 'unset', 'empty', 'missing', 'paid'):
             with self.subTest(kind=kind):
                 self.stage(True, kind)
 

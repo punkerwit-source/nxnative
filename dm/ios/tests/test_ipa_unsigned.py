@@ -84,7 +84,7 @@ class UnsignedIpaTests(unittest.TestCase):
 
     @unittest.skipUnless(CAN_SIGN, 'needs macOS codesign and a C compiler')
     def test_executable_carries_the_entitlements(self):
-        cases = [({}, True), ({'DM_ENTITLEMENTS': ''}, False)]
+        cases = [({}, False), ({'DM_ENTITLEMENTS': ''}, False), ({'DM_IOS_MEMORY_ENTITLEMENTS': '1'}, True)]
         for extra, expected in cases:
             with self.subTest(extra=extra), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)

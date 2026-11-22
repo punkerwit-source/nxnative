@@ -1062,7 +1062,24 @@ void dm_thread_cpu(char *out, size_t n, double secs) {
     for (int i = 0; i < 3 && top[i] && o < n; i++)
         o += (size_t)snprintf(out + o, n - o, "%s%#x '%s' priority %d %.0f ms/s%s", i ? ", " : "", top[i]->handle, thr_name(top[i], nb, sizeof nb), top[i]->prio, d[i], top[i]->host_owned ? " (host-created)" : "");
     if (!top[0] && o < n) snprintf(out + o, n - o, "none");
+    thr_t *hot = secs >= 5 && d[0] >= 800 && top[0] && !top[0]->host_owned ? top[0] : NULL;
+    int hot_prio = hot ? hot->prio : 0, hot_svc = hot ? hot->last_svc : 0, hot_kind = hot ? hot->wkind : 0;
+    uint64_t hot_lr = hot ? hot->last_lr : 0; uint32_t hot_h = hot ? hot->handle : 0;
+    char hot_name[32]; if (hot) thr_name(hot, hot_name, sizeof hot_name);
     g_unlock();
+    // A guest thread that has held about a core for this whole window, while frames may still be presented. Not a host wait: wkind 0 means it is running its own code.
+    if (hot) {
+        static uint64_t told; uint64_t now = now_ns();
+        if (!told || now - told > 15000000000ull) {
+            told = now;
+            void mem_alias_use(uint64_t *, uint64_t *, uint64_t *); uint64_t cap = 0, mapped = 0, hw = 0; mem_alias_use(&cap, &mapped, &hw);
+            module_t *lm = module_of((void *)hot_lr);
+            LOG("[thr] guest thread %#x '%s' priority %d has used %.0f ms/s for %.1f s (wait kind %d, last SVC %#x at %s+%#llx). Alias region %.2f GB, mapped %.2f GB, high water +%.2f GB. PC and backtrace follow",
+                hot_h, hot_name, hot_prio, d[0], secs, hot_kind, hot_svc, lm ? lm->name : "?", lm ? hot_lr - (uint64_t)lm->base : hot_lr,
+                cap / 1073741824.0, mapped / 1073741824.0, hw / 1073741824.0);
+            thr_bt(hot);
+        }
+    }
 }
 // Sleep until dl (host monotonic ns) on time: macOS nanosleep / mach_wait_until carry timer slack; measured, 33 ms sleeps take about 36.4 ms, 5 ms take 6.1 ms, 1 ms take 1.26 ms (the same at any QoS).
 // Metroid Dread's sound thread sleeps "33 ms minus this round's work" (main+0xf95b0), and on the host its period became 36.9 ms; cutscenes render a frame whenever the audio play position that thread updates moves, so they ran at about 27 fps (30 on the Switch).
