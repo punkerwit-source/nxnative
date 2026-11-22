@@ -156,7 +156,8 @@ static void msync_span(uint8_t *p, size_t n, int flags) {
 }
 static void guest_file_writeback(int chunks, int sync_n) {
     if (!g_gf_n || chunks <= 0) return;
-    size_t heap_n = g_heap ? atomic_load(&g_heap_cur) : 0, alias_n = g_alias ? (size_t)atomic_load(&g_alias_hw) : 0, span = heap_n + alias_n;
+    uint8_t *alias = g_alias;   // local, so a null alias is not added to: the high water is then zero and the else branch does not run
+    size_t heap_n = g_heap ? atomic_load(&g_heap_cur) : 0, alias_n = alias ? (size_t)atomic_load(&g_alias_hw) : 0, span = heap_n + alias_n;
     if (span < 65536) return;
     static _Atomic uint64_t cursor;
     size_t step = 64u << 20;
@@ -166,10 +167,10 @@ static void guest_file_writeback(int chunks, int sync_n) {
         if (off < heap_n) {
             size_t n = off + step > heap_n ? heap_n - off : step;
             msync_span(g_heap + off, n, flags);
-            if (n < step && alias_n) msync_span(g_alias, step - n < alias_n ? step - n : alias_n, MS_ASYNC);
-        } else {
+            if (n < step && alias) msync_span(alias, step - n < alias_n ? step - n : alias_n, MS_ASYNC);
+        } else if (alias) {
             size_t a = off - heap_n, n = a + step > alias_n ? alias_n - a : step;
-            msync_span(g_alias + a, n, flags);
+            msync_span(alias + a, n, flags);
         }
     }
 }
@@ -209,12 +210,13 @@ void mem_emergency_sync(void) {
     if (g_heap && heap_n >= 4096) madvise(g_heap, heap_n, MADV_PAGEOUT);
 #endif
     for (size_t off = 0; off < heap_n; off += step) msync_span(g_heap + off, off + step > heap_n ? heap_n - off : step, MS_SYNC);
-    size_t alias_n = g_alias ? (size_t)atomic_load(&g_alias_hw) : 0, lim = alias_n < (1ull << 30) ? alias_n : (1ull << 30);
+    uint8_t *alias = g_alias;
+    size_t alias_n = alias ? (size_t)atomic_load(&g_alias_hw) : 0, lim = alias_n < (1ull << 30) ? alias_n : (1ull << 30);
     static _Atomic uint64_t cursor;
-    for (size_t done = 0; done < lim && alias_n; done += step) {
+    for (size_t done = 0; done < lim && alias; done += step) {
         size_t off = (size_t)(atomic_fetch_add(&cursor, step) % alias_n);
         size_t n = off + step > alias_n ? alias_n - off : step;
-        msync_span(g_alias + off, n, MS_SYNC);
+        msync_span(alias + off, n, MS_SYNC);
     }
     mem_room_log_at("emergency sync", 1);
 }
