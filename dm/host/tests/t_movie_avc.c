@@ -6,10 +6,15 @@
 #define HLE_FORCE(mangled, why, ret, cname, ...) static ret cname(__VA_ARGS__)
 #include <VideoToolbox/VideoToolbox.h>
 static OSStatus synthetic_decode(VTDecompressionSessionRef, CMSampleBufferRef, VTDecodeFrameFlags, void *, VTDecodeInfoFlags *);
+// The fixture's session is the decoder pointer, not a VideoToolbox object (synthetic_avc). DecodeFrame is replaced; the real WaitForAsynchronousFrames
+// would dereference that pointer inside FinishDelayedFrames. The synthetic callback has already run before DecodeFrame returns.
+static OSStatus synthetic_wait(VTDecompressionSessionRef session) { (void)session; return noErr; }
 #define VTDecompressionSessionDecodeFrame synthetic_decode
+#define VTDecompressionSessionWaitForAsynchronousFrames synthetic_wait
 #include "../hle_movie.c"
 #include "../hle_movie_avc.c"
 #undef VTDecompressionSessionDecodeFrame
+#undef VTDecompressionSessionWaitForAsynchronousFrames
 #include <assert.h>
 
 uint64_t now_ns(void) { return 1; }
