@@ -8,6 +8,7 @@
 #import <Metal/Metal.h>
 #import <AVFAudio/AVFAudio.h>
 #include <errno.h>
+#include <os/proc.h>   // os_proc_available_memory: the jetsam headroom, logged at boot and every 30 s
 #include <stdatomic.h>   // g_screen_hz: read on the main thread, used from the render thread (front_screen_max_fps)
 #include "front.h"
 #include "hle.h"
@@ -36,7 +37,7 @@ static void front_ios_audio_watch(void);
 static UILabel *front_ios_fps_label(void);
 
 @interface DmGameView : UIView
-@property (nonatomic) CGFloat maxPixelWidth;   // 0: the screen's own pixels; a TV caps the drawable at 1920 across (tv_attach)
+@property (nonatomic) CGFloat maxPixelWidth;   // 0: the screen's own pixels; a TV may cap the drawable (DM_TV_MAX_WIDTH)
 @end
 @implementation DmGameView
 + (Class)layerClass { return CAMetalLayer.class; }
@@ -244,25 +245,55 @@ UIViewController *front_ios_root(void) { return [DmRootVC new]; }
 @end
 @implementation DmTVVC
 - (void)viewDidLoad { [super viewDidLoad]; self.view.backgroundColor = UIColor.blackColor; }
-- (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; for (UIView *v in self.view.subviews) v.frame = dm_aspect_fit(self.view.bounds, g_picture_aspect); }
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    // The TV's safe area is the overscan inset UIKit reports. DM_TV_SAFE=0 uses the full panel.
+    const char *safe = getenv("DM_TV_SAFE");
+    CGRect b = self.view.bounds;
+    if (!(safe && !strcmp(safe, "0"))) b = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets);
+    for (UIView *v in self.view.subviews) v.frame = dm_aspect_fit(b, g_picture_aspect);
+}
 @end
 static UIWindow *g_tv; static int g_tv_mode_was = -1;
+// DM_TV_MAX_WIDTH: pixels across the external picture. Unset or 0 is the panel's own pixels. 1920 is the old cap (a 4K AirPlay drawable once went black and took the GPU from 15 ms to 60).
+static CGFloat tv_max_width(void) {
+    const char *e = getenv("DM_TV_MAX_WIDTH");
+    if (!e || !*e) return 0;
+    return (CGFloat)atof(e);
+}
 static void tv_attach(void) {
     DmGameView *v = g_root.game; if (!g_tv || !v || v.superview == g_tv.rootViewController.view) return;
-    // at most 1080p: the game renders 1080p docked, and a 4K drawable only adds an upscale and a 4K stream (an AirPlay TV showed black, the GPU went from 15 to 60 ms a frame).
-    // Taken from the picture, not the screen, so a display of another shape still gets the full 1920 pixels across the picture (DmGameView layoutSubviews applies it)
-    v.maxPixelWidth = 1920;
-    [g_tv.rootViewController.view addSubview:v]; [g_tv.rootViewController.view setNeedsLayout]; [g_root.view setNeedsLayout];   // the phone's pad takes the whole screen
-    CGRect f = dm_aspect_fit(g_tv.bounds, g_picture_aspect); CGFloat scale = MIN(g_tv.windowScene.screen.nativeScale, 1920.0 / MAX(f.size.width, 1));
+    v.maxPixelWidth = tv_max_width();
+    [g_tv.rootViewController.view addSubview:v]; [g_tv.rootViewController.view layoutIfNeeded]; [g_root.view setNeedsLayout];   // the phone's pad takes the whole screen; one Metal layer, so the phone is not a second copy
     if (g_tv_mode_was < 0) g_tv_mode_was = dm_opmode();
     dm_set_opmode(1); dm_gamepad_opmode_changed();
-    LOG("front end: TV connected (%.0fx%.0f points), the picture moves there at %.0fx%.0f, console mode", g_tv.bounds.size.width, g_tv.bounds.size.height, f.size.width * scale, f.size.height * scale);
+    screen_refresh();   // the link must follow this screen now, not the phone's 120 Hz, before the next present
+    UIScreen *screen = g_tv.windowScene.screen;
+    if (!screen) { LOG("front end: external window has no screen yet"); return; }
+    CGRect f = v.frame; CGFloat scale = v.maxPixelWidth > 0 ? MIN(screen.nativeScale, v.maxPixelWidth / MAX(f.size.width, 1)) : screen.nativeScale;
+    const char *hdr = getenv("DM_TV_HDR");
+    CAMetalLayer *layer = (CAMetalLayer *)v.layer;
+    BOOL edr = hdr && !strcmp(hdr, "1");
+    layer.pixelFormat = edr ? MTLPixelFormatBGR10_XR : MTLPixelFormatBGRA8Unorm;
+    if (@available(iOS 16.0, *)) layer.wantsExtendedDynamicRangeContent = edr;
+    CGFloat head = 1;
+    if (@available(iOS 16.0, *)) head = screen.currentEDRHeadroom;
+    LOG("front end: external display %.0fx%.0f points, native scale %.2f, %d Hz, drawable %.0fx%.0f%s, EDR headroom %.2f (DM_TV_HDR=%s). The picture is only on this screen; the phone shows the pad",
+        g_tv.bounds.size.width, g_tv.bounds.size.height, screen.nativeScale, front_screen_max_fps(), f.size.width * scale, f.size.height * scale,
+        v.maxPixelWidth > 0 ? " (DM_TV_MAX_WIDTH)" : "", head, edr ? "1" : "off");
 }
 static void tv_detach(void) {
-    DmGameView *v = g_root.game; g_tv = nil; v.maxPixelWidth = 0;
-    if (v && v.superview != g_root.view) { [g_root.view insertSubview:v atIndex:0]; [g_root.view setNeedsLayout]; }
+    DmGameView *v = g_root.game; g_tv = nil;
+    if (v) {
+        v.maxPixelWidth = 0;
+        CAMetalLayer *layer = (CAMetalLayer *)v.layer;
+        layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        if (@available(iOS 16.0, *)) layer.wantsExtendedDynamicRangeContent = NO;
+        if (v.superview != g_root.view) { [g_root.view insertSubview:v atIndex:0]; [g_root.view setNeedsLayout]; }
+    }
     if (g_tv_mode_was >= 0) { dm_set_opmode(g_tv_mode_was); g_tv_mode_was = -1; dm_gamepad_opmode_changed(); }
-    LOG("front end: TV disconnected, the picture is back on the phone");
+    screen_refresh();
+    LOG("front end: external display disconnected, the picture is back on the phone at %d Hz", front_screen_max_fps());
 }
 void front_picture_shape(int w, int h) {   // front.h: the views take the presented picture's shape (a taller one under DM_SCREEN_ASPECT) instead of 16:9
     if (w <= 0 || h <= 0) return;
@@ -304,6 +335,7 @@ bool dm_setting_live(const char *env, const char *value) {
     self.window.rootViewController = [DmTVVC new];
     self.window.hidden = NO;   // without a window iOS goes on mirroring the phone; not key, so the phone's window keeps the keyboard
     g_tv = self.window; tv_attach();
+    LOG("front end: external scene connected (not a mirror)");
 }
 - (void)sceneDidDisconnect:(UIScene *)s { if (g_tv == self.window) tv_detach(); self.window = nil; }
 @end
@@ -324,6 +356,13 @@ static void front_ios_power_watch(void) {
     [NSNotificationCenter.defaultCenter addObserverForName:UIScreenModeDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; screen_refresh(); }];
     screen_refresh();
     LOG("front end: thermal state %d, brightness %.2f, Low Power Mode %s, screen %d Hz", dm_thermal_now(), g_brightness, dm_low_power_now() ? "on" : "off", front_screen_max_fps());
+    LOG("[mem] os_proc_available_memory %llu MB at launch (how far this process is from the jetsam limit)", (unsigned long long)(os_proc_available_memory() >> 20));
+    [NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(NSTimer *t) {
+        (void)t; LOG("[mem] os_proc_available_memory %llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIScreenDidConnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+        (void)n; LOG("front end: a display connected (%lu screens). An external scene puts the picture on it; until that scene connects, iOS mirrors the phone", (unsigned long)UIScreen.screens.count);
+    }];
 }
 
 // Frame-rate counter: the frames put on screen in the last second (nvn_mtl.m counts them for NVN and for the Vulkan layer alike; frames the display link merged away are not counted).
@@ -391,11 +430,13 @@ static void screen_refresh(void) {
     UIWindowScene *ws = (g_root.game ?: g_root.view).window.windowScene;
     if (!ws) for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
         if ([s isKindOfClass:UIWindowScene.class] && [s.session.role isEqualToString:UIWindowSceneSessionRoleApplication]) { ws = (UIWindowScene *)s; break; }
+    BOOL external = ws && [ws.session.role isEqualToString:UIWindowSceneSessionRoleExternalDisplayNonInteractive];
     int hz = ws ? (int)ws.screen.maximumFramesPerSecond : 0, lpm = dm_low_power_now();
     if (hz <= 0) return;   // no screen yet: keep what was read
-    if (lpm && hz > 60) hz = 60;
+    // Low Power Mode holds the phone's ProMotion panel at 60. It does not change an external panel's rate, and the 120 Hz present path must not run on a 60 Hz TV.
+    if (lpm && hz > 60 && !external) hz = 60;
     int was = atomic_exchange_explicit(&g_screen_hz, hz, memory_order_relaxed);
-    if (was && was != hz) LOG("front end: screen %d Hz → %d Hz%s", was, hz, lpm ? " (Low Power Mode)" : "");
+    if (was && was != hz) LOG("front end: screen %d Hz → %d Hz%s%s", was, hz, external ? " (external display)" : "", !external && lpm ? " (Low Power Mode)" : "");
 }
 // Offline HTML pages (web_apple.m): the page's view goes over the game view and under the gamepad, which lets touches on no control through to it while the page is
 // shown (DmGamepad.m hitTest); the page takes them as a click on what they land on, and the gamepad and controllers drive it as on the Switch

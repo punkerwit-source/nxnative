@@ -34,6 +34,10 @@ Joy-Con 2 and Pro Controller 2 gyro come over Bluetooth LE ([Switch 2 controller
 
 English by default. Pick another when packing with `--language` (`-l`), by code or by name: `-l ja`, `-l zh-Hans`, `-l French` (`LANGUAGE` in Spyder). It must be one the game has; the script prints the game's languages and stops on one it lacks. To change it without rebuilding, pick another on the settings screen.
 
+## On a TV
+
+A cable or AirPlay display is a scene of its own, not a mirror of the phone. The picture moves there and the phone keeps the touch controls. The present rate follows that screen, so a 60 Hz TV does not keep the phone's 120 Hz timing. The drawable is the panel's own pixels unless `DM_TV_MAX_WIDTH` sets a cap (`1920` is the old one). The picture stays inside the TV's safe area unless `DM_TV_SAFE=0`. `DM_TV_HDR=1` outputs an extended-range format; leave it unset for the game's SDR picture. The log line `external display` names the size, the rate and the drawable. `a display connected` with no `external scene connected` after it means iOS is still mirroring.
+
 ## Settings in a file
 
 Lines like `DM_OPMODE=0` (handheld mode: lower resolution, higher frame rate) in `Documents/env.txt` win over the settings screen, which then shows them greyed out ([the full list](settings.md#settings-in-a-file)). `DM_FPS_TARGET=30` keeps Breath of the Wild, Tears of the Kingdom, Octopath Traveler 0 and Octopath Traveler II at their original 30 fps, which saves battery; `DM_PRESENT_INTERVAL=game` does the same for Monster Train 2. `DM_SHOW_FPS=1` shows the frame rate at the top left (`--show-fps` when packing turns it on from the start). `DM_LAUNCHER=0` skips the settings screen.
