@@ -558,6 +558,13 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Check:** `make -C dm/gfx/tests GAME=<id> check_t_present_rescue` (`thirty`: the link's mode and range at 30 fps in a window, in fixed-rate and variable-refresh fullscreen, and back).
 - **Not checked:** variable-refresh fullscreen at 30 fps, external fixed-rate screens, other games at a 30 fps target, and the power cost of 60 callbacks a second instead of 30.
 
+### A 120 Hz iPhone paces 30 and 60 on the 120 Hz link
+
+- **Symptom:** at `DM_FPS_TARGET=30` on an iPhone 17 Pro the automatic display link is 30 Hz. A skipped tick holds the frame for 66 ms. At 60 fps the link is 60 Hz on a panel that refreshes at 120.
+- **Cause:** with the present-queue drain off (the iOS default) `link_30hz` selects the 30 Hz link at a 30 fps target. The 60 Hz link is the automatic choice at any other target. `front_screen_max_fps` already reports 60 in Low Power Mode, which holds ProMotion at 60.
+- **Fix:** when `DM_PRESENT_LINK` is unset and that rate is at least 120, `link_ios_120` uses the 120 Hz link. A 30 fps frame waits four ticks and a 60 fps frame waits two, so a miss is one 8.3 ms refresh. `DM_PRESENT_LINK=1` keeps 60 Hz and `0` acquires the drawable. The Mac's fullscreen rules are unchanged.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), iPhone 17 Pro, iOS 27.2.1. Not measured on the phone after the change.
+
 ### An explicit display link is ignored at 30 fps
 
 - **Symptom:** `DM_PRESENT_LINK=1` and `DM_PRESENT_LINK=2` both select the 30 Hz link at a 30 fps target in variable-refresh fullscreen.

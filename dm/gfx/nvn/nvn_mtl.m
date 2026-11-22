@@ -600,6 +600,7 @@ static unsigned rh_trim(int force) {
     if (nd) atomic_fetch_add(&g_rh_trimmed, nd);
     return nd;
 }
+static _Atomic int g_tu_idle_ds;   // tu_pass's idle, in deciseconds, while the iOS cap is hot; 0 keeps TU_IDLE
 // iOS jetsam kills the process with no log once phys_footprint nears the phone's limit. Past the cap, drop GPU copies nothing names any more:
 // sharing-table textures with no serial or pin, idle for a couple of seconds of submissions, and render-target heaps waiting to be reused.
 // Live textures the game still holds stay. DM_NVN_IOS_GPU_CAP_MB (default 4600) is currentAllocatedSize; DM_NVN_IOS_HEADROOM_MB (default 1536)
@@ -619,13 +620,14 @@ static void ios_gpu_pressure(void) {
     last_ns = ns;
     uint64_t gpu = g_dev.currentAllocatedSize;
     size_t avail = os_proc_available_memory();
-    if (!((cap > 0 && gpu >= (uint64_t)cap << 20) || (room > 0 && avail < (size_t)room << 20))) return;
+    if (!((cap > 0 && gpu >= (uint64_t)cap << 20) || (room > 0 && avail < (size_t)room << 20))) { atomic_store(&g_tu_idle_ds, 0); return; }
     unsigned heaps = 0, n;
     for (int i = 0; i < 32 && (n = rh_trim(1)); i++) heaps += n;
     uint32_t ntex = 0;
     pthread_mutex_lock(&g_smu);
-    uint64_t bytes = own_alias_idle_drop_locked(2000, 512, &ntex);
+    uint64_t bytes = own_alias_idle_drop_locked(200, 512, &ntex);
     pthread_mutex_unlock(&g_smu);
+    atomic_store(&g_tu_idle_ds, 5);   // drawn-over render targets go after 0.5 s while the cap is hot (tu_pass); 3 s otherwise
     for (int i = 0; i < 32 && (n = rh_trim(1)); i++) heaps += n;
     static int lines;
     if (lines < 40 && (ntex || heaps || lines < 3)) { lines++;
@@ -10589,7 +10591,12 @@ static void pso4_init(void) {
         pso_bundle_open(archp, plan);   // first: it holds every pair's base
         pso_bundle_open_prewarm(arch, plan);   // then the prewarm lists' pipelines made at build time (the prebuild tool's bundle form, --prebake), before the device's files
         if (g_arch_dir) {
-            g_arch_q = dispatch_queue_create("dm.nvn.pso-archive", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+            // The write holds every capture until it finishes (ser_begin). On iOS that queue was utility, so a prebuild's compiles waited on a background writer: Ocarina of Time's on-device prebuild logged hundreds of seconds of compiles held back by the writes.
+            dispatch_qos_class_t aq = QOS_CLASS_UTILITY;
+#if TARGET_OS_IPHONE
+            aq = QOS_CLASS_USER_INITIATED;
+#endif
+            g_arch_q = dispatch_queue_create("dm.nvn.pso-archive", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, aq, 0));
             g_arch_pending = dispatch_group_create();
             if (ga_own()) {   // before the first serializer (ep_new below): this run's folder is never among them
                 static int lock_fd; NSString *gd = ga_dir(); NSSet<NSString *> *old = ga_claim(gd, &lock_fd);
@@ -11989,7 +11996,18 @@ static void warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
 static void prepare_prebuild(void) {
     const char *e = getenv("DM_PSO_PREBUILD"); if (e && !strcmp(e, "0")) return;
     if (!hybrid_on()) return;
-    int n = pso_prebuild(prepare_workers(), 0, QOS_CLASS_USER_INITIATED);
+    // On iOS the first start compiles every pair before the game draws. Use Metal's compile width and user-interactive QoS: the prepare step measured on an iPhone 17 Pro
+    // ran about 28-52 pairs a second, and the archive writes (utility QoS) held compiles back. DM_PSO_PREPARE_QOS=utility or initiated puts the workers back down. The background
+    // prebuild during play stays at utility (pso_prebuild_bg): that load shares the GPU's power budget.
+    int threads = prepare_workers(); dispatch_qos_class_t qos = QOS_CLASS_USER_INITIATED;
+#if TARGET_OS_IPHONE
+    { int ct = compile_tasks(); if (ct > threads) threads = ct; qos = QOS_CLASS_USER_INTERACTIVE; }
+#endif
+    { const char *q = getenv("DM_PSO_PREPARE_QOS");
+      if (q && !strcmp(q, "utility")) qos = QOS_CLASS_UTILITY;
+      else if (q && !strcmp(q, "initiated")) qos = QOS_CLASS_USER_INITIATED;
+      else if (q && !strcmp(q, "interactive")) qos = QOS_CLASS_USER_INTERACTIVE; }
+    int n = pso_prebuild(threads, 0, qos);
     if (n <= 0) return;
     uint64_t t0 = bp_now(); int shown = 0;
     // every pair handed out and none put back (pre_pair): a pair whose shader function was under way waits in g_pre_later, and counts as not yet built
@@ -12857,7 +12875,8 @@ static void tu_pass(void) { @autoreleasepool {
     if (!g_tu.n) return;
     uint64_t *sers = NULL; uint32_t nser = 0;
     pthread_mutex_lock(&g_smu);
-    own_dead_stats st = own_alias_dead_locked(now, TU_IDLE, tu_use_of, TU_MAX, &sers, &nser);
+    int idle_ds = atomic_load(&g_tu_idle_ds);
+    own_dead_stats st = own_alias_dead_locked(now, idle_ds > 0 ? (uint32_t)idle_ds : TU_IDLE, tu_use_of, TU_MAX, &sers, &nser);
     pthread_mutex_unlock(&g_smu);
     if (nser) {
         os_unfair_lock_lock(&g_rmu);
@@ -19524,6 +19543,16 @@ static int link_30hz(void) { return front_fullscreen() ? front_screen_variable_r
 // no such mode or with DM_SCREEN_MATCH=0: the 120 Hz link held 59.2 fps, about 2% of frames up 25 ms. A window keeps the 60 Hz link, where every present lands on its
 // target (docs/reference/frame-rate.md)
 static int link_vrr_120(void) { int hz = front_screen_max_fps(); return !g_present_link_env && front_fullscreen() && front_screen_variable_refresh() && hz >= 120 && hz % 120 == 0; }
+// iPhone and iPad: a 120 Hz panel (Low Power Mode already reports 60 from front_screen_max_fps) paces 30 and 60 fps on the 120 Hz link. A 30 fps frame waits four ticks and a
+// missed one is one 8.3 ms refresh late, instead of a 30 Hz link whose skipped tick holds a frame for 66 ms. DM_PRESENT_LINK still wins. The Mac keeps its own rules.
+static int link_ios_120(void) {
+#if TARGET_OS_IPHONE
+    int hz = front_screen_max_fps();
+    return !g_present_link_env && hz >= 120 && hz % 120 == 0;
+#else
+    return 0;
+#endif
+}
 static int g_link_mode = 1;   // Current mode of the display link object: 1 / 2 same as g_dm_present_link, 3 = power-saving mode 30 Hz
 static void *link_main(void *arg) {   // Display link thread: started when switching to display-link mode, exits when switching back to 0
     (void)arg;
@@ -19553,7 +19582,8 @@ static void link_sync(void) {   // Called every frame by the game's present thre
     }
     if (g_rescue_mode) want = 0;
     pthread_mutex_unlock(&g_pq_mu);
-    if (!g_present_link_env && want && mtl_fps_target() == 30 && link_30hz()) want = 3;   // 30 Hz power-saving mode when the link rate is automatic
+    if (!g_present_link_env && want && mtl_fps_target() == 30 && link_30hz() && !link_ios_120()) want = 3;   // 30 Hz power-saving mode when the link rate is automatic
+    if (link_ios_120() && (want == 1 || want == 3)) want = 2;   // 120 Hz panel: 60 fps is every other tick, 30 fps is every fourth
     if (want) front_screen_match(want == 3 ? 30 : want == 2 ? 120 : 60);   // the game's rate: a variable-refresh screen goes to a fixed-rate mode at a multiple where it has one
     static int vrr_was; int vrr = want == 1 && link_vrr_120();   // variable-refresh fullscreen that kept its mode: the 120 Hz link paces the 60 (link_vrr_120)
     if (vrr != vrr_was) { vrr_was = vrr; MLOG("display link: %s (frame %llu)", vrr ? "120 Hz in fullscreen on a variable-refresh screen, a frame every other tick (DM_PRESENT_LINK=1 keeps 60 Hz)" : "60 Hz again (window, fixed-rate screen or another frame rate)", (unsigned long long)atomic_load(&g_cur_frame)); }
