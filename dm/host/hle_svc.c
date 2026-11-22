@@ -145,25 +145,39 @@ static int ios_headroom_mb(void) {
     if (v == -2) { const char *e = getenv("DM_NVN_IOS_HEADROOM_MB"); v = e && *e ? atoi(e) : 1536; }
     return v;
 }
-// Ask the kernel to write dirty guest-file pages back. Once clean they leave phys_footprint (the compressed set is where a dirty file page waits). MS_ASYNC does not
-// unmap them and does not wait. A no-copy Metal buffer over a pool keeps its own wiring; this only schedules the write. Chunks of 64 MB, walking the alias high water.
-static void guest_file_writeback(int chunks) {
-    if (!g_gf_n || !g_alias || chunks <= 0) return;
-    size_t hw = (size_t)atomic_load(&g_alias_hw);
-    if (hw < 65536) return;
+// Ask the kernel to write dirty guest-file pages back. Once clean they leave phys_footprint: the compressed set is where a dirty file page waits, and on a long
+// Ocarina session that set sat near 3.7 GB while mincore still saw about 2 GB dirty. The heap is the part the game keeps mapped; walking only the alias left it compressed.
+// MS_ASYNC schedules the write. sync_one forces the first chunk through (MS_SYNC) so the kernel cannot leave it compressed until jetsam. A no-copy Metal buffer over a pool
+// keeps its own wiring. Chunks of 64 MB, heap first, then the alias high water. A chunk with a hole (PROT_NONE) can fail; the next chunk still runs.
+static void msync_span(uint8_t *p, size_t n, int flags) {
+    if (!p || n < 4096) return;
+    if (msync(p, n, flags)) { static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 3) LOG("[RED] [mem] guest file writeback %zu MB failed (errno %d)", n >> 20, errno); }
+}
+static void guest_file_writeback(int chunks, int sync_one) {
+    if (!g_gf_n || chunks <= 0) return;
+    size_t heap_n = g_heap ? atomic_load(&g_heap_cur) : 0, alias_n = g_alias ? (size_t)atomic_load(&g_alias_hw) : 0, span = heap_n + alias_n;
+    if (span < 65536) return;
     static _Atomic uint64_t cursor;
     size_t step = 64u << 20;
     for (int i = 0; i < chunks; i++) {
-        size_t off = (size_t)(atomic_fetch_add(&cursor, step) % hw);
-        size_t n = off + step > hw ? hw - off : step;
-        msync(g_alias + off, n, MS_ASYNC);
+        size_t off = (size_t)(atomic_fetch_add(&cursor, step) % span);
+        int flags = (sync_one && i == 0) ? MS_SYNC : MS_ASYNC;
+        if (off < heap_n) {
+            size_t n = off + step > heap_n ? heap_n - off : step;
+            msync_span(g_heap + off, n, flags);
+            if (n < step && alias_n) msync_span(g_alias, step - n < alias_n ? step - n : alias_n, MS_ASYNC);
+        } else {
+            size_t a = off - heap_n, n = a + step > alias_n ? alias_n - a : step;
+            msync_span(g_alias + a, n, flags);
+        }
     }
 }
-static void mem_room_log(const char *why) {
+static void mem_room_log_at(const char *why, int force) {
     static uint64_t last;
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-    if (last && now - last < 2000000000ull) return;
+    if (!force && last && now - last < 2000000000ull) return;
+    if (force && last && now - last < 1000000000ull) return;
     last = now;
     task_vm_info_data_t vi; mach_msg_type_number_t nc = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &nc) != KERN_SUCCESS) memset(&vi, 0, sizeof vi);
@@ -178,7 +192,13 @@ static void mem_room_log(const char *why) {
         why, (unsigned long long)(avail >> 20), vi.phys_footprint / G, vi.internal / G, vi.compressed / G, (double)atomic_load(&g_gf_dirty_bytes) / G,
         gfx[0] ? "; " : "", gfx);
 }
+static void mem_room_log(const char *why) { mem_room_log_at(why, 0); }
 #if TARGET_OS_IPHONE
+void mem_headroom_watch(void) {   // a submission while the last sample was already under the floor (nvn_mtl.m): the 1 s pass can miss the drop
+    size_t avail = os_proc_available_memory();
+    if (avail >= (400u << 20)) return;
+    mem_room_log_at("headroom under 400 MB", 1);
+}
 static void mem_pressure_start(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -187,7 +207,7 @@ static void mem_pressure_start(void) {
         if (!src) return;
         dispatch_source_set_event_handler(src, ^{
             atomic_store(&g_mem_hot, 1);
-            if (g_gf_n) { guest_file_sweep(); guest_file_writeback(8); }
+            if (g_gf_n) { guest_file_sweep(); guest_file_writeback(8, 1); }
             mem_room_log("memorypressure");
         });
         dispatch_resume(src);
@@ -233,7 +253,16 @@ static void *guest_file_thread(void *arg) {
 #if TARGET_OS_IPHONE
         { size_t avail = os_proc_available_memory(); int room = ios_headroom_mb();
           int low = room > 0 && avail < (size_t)room << 20;
-          if (low || atomic_load(&g_mem_hot)) { guest_file_sweep(); guest_file_writeback(low ? 4 : 1); if (sec % 10 == 0) mem_room_log("pressure"); }
+          int tight = avail < (1200u << 20);
+          uint64_t dirty_b = atomic_load(&g_gf_dirty_bytes);
+          if (avail < (400u << 20)) mem_room_log_at("headroom under 400 MB", 1);
+          // Dirty file pages are the compressor. Write them back before headroom is already low, heap and alias, and force one chunk through when the margin is thin.
+          if (low || atomic_load(&g_mem_hot) || dirty_b > (512ull << 20)) {
+              if (low || atomic_load(&g_mem_hot)) guest_file_sweep();
+              int chunks = tight || dirty_b > (1ull << 30) ? 8 : 4;
+              guest_file_writeback(chunks, tight || atomic_load(&g_mem_hot));
+              if (low && (tight ? sec % 2 == 0 : sec % 10 == 0)) mem_room_log("pressure");
+          }
           if (!low && avail > ((size_t)room << 20) + (256u << 20)) atomic_store(&g_mem_hot, 0); }
 #endif
         double need = dirty > 0 ? dirty : 0, held = 0;
@@ -580,6 +609,10 @@ static void alias_query(uint64_t addr, uint64_t *base, uint64_t *size, int *mapp
 // in again from a hole; they are only marked (g_alias_rel), and guest_file_sweep punches those still given back after a whole sweep interval. The heap's are punched at once
 static int guest_release(uintptr_t lo, uintptr_t hi, int alias) {
     if (g_gf_n) {
+        // While the pages are still writable. MADV_FREE after PROT_NONE returns 0 and drops nothing (memory.md). The punch is what gives the blocks back; this asks the
+        // kernel to drop the compressed copies of pages the guest has already freed, including alias pages that wait for the sweep.
+        if (madvise((void *)lo, hi - lo, MADV_FREE)) {}
+        if (madvise((void *)lo, hi - lo, MADV_DONTNEED)) {}
         if (mprotect((void *)lo, hi - lo, PROT_NONE)) die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
         if (g_gf_punch && !alias) guest_file_punch(lo, hi);
         else if (g_gf_punch) { size_t pg = (size_t)getpagesize(); for (uint64_t h = (lo - (uintptr_t)g_alias) / pg, e = (hi - (uintptr_t)g_alias) / pg; h < e; h++) g_alias_rel[h >> 6] |= UINT64_C(1) << (h & 63); }

@@ -607,12 +607,16 @@ static void up_pressure_release(void);
 // iOS jetsam kills the process with no log once phys_footprint nears the phone's limit. Past the cap, drop GPU copies nothing names any more:
 // sharing-table textures with no serial or pin, idle for a couple of seconds of submissions, and render-target heaps waiting to be reused.
 // Live textures the game is drawing stay. DM_NVN_IOS_GPU_CAP_MB is an optional currentAllocatedSize cap (default 0: off). DM_NVN_IOS_HEADROOM_MB
-// (default 1536) is the os_proc_available_memory floor. Under it the host drops idle copies and lets the system discard packaged textures the game has not sampled. Either at 0 turns that half off; both at 0 turns the pass off. The Mac has no jetsam limit of this kind
+// (default 1536) is the os_proc_available_memory floor. Under it the host drops idle copies and purges packaged textures the game has not sampled. Either at 0 turns that half off; both at 0 turns the pass off. The Mac has no jetsam limit of this kind
 #if TARGET_OS_IPHONE
 static uint32_t pkg_mark_volatile(uint64_t idle_subs, uint32_t max_n);
+static uint32_t pkg_purge_idle(uint32_t max_n, uint64_t *bytes);
+__attribute__((weak)) void mem_headroom_watch(void) {}
+static int g_ios_hot;
 #endif
 static void ios_gpu_pressure(void) {
 #if TARGET_OS_IPHONE
+    if (g_ios_hot) mem_headroom_watch();   // every submission once a sample was under the floor, so a drop under 400 MB is logged before the next 1 s pass
     static int cap = -2, room = -2;
     if (cap == -2) {
         const char *e = getenv("DM_NVN_IOS_GPU_CAP_MB"), *r = getenv("DM_NVN_IOS_HEADROOM_MB");
@@ -626,22 +630,28 @@ static void ios_gpu_pressure(void) {
     last_ns = ns;
     uint64_t gpu = g_dev.currentAllocatedSize;
     size_t avail = os_proc_available_memory();
-    if (!((cap > 0 && gpu >= (uint64_t)cap << 20) || (room > 0 && avail < (size_t)room << 20))) { atomic_store(&g_tu_idle_ds, 0); return; }
+    int hot = (cap > 0 && gpu >= (uint64_t)cap << 20) || (room > 0 && avail < (size_t)room << 20);
+    g_ios_hot = hot;
+    if (!hot) { atomic_store(&g_tu_idle_ds, 0); return; }
+    int tight = avail < (1200u << 20);   // menu close allocated about 670 MB of GPU while packaged copies were still resident
+    if (avail < (400u << 20)) mem_headroom_watch();
     unsigned heaps = 0, n;
     for (int i = 0; i < 32 && (n = rh_trim(1)); i++) heaps += n;
-    uint64_t idle = avail < (256u << 20) ? 1 : avail < ((size_t)room << 19) ? 30 : 200;   // room/2: shed unheld copies within a second; under 256 MB, at once
+    uint64_t idle = tight ? 8 : avail < (256u << 20) ? 1 : avail < ((size_t)room << 19) ? 30 : 200;   // under 1.2 GB, shed unheld copies within a few submissions
     uint32_t ntex = 0;
     pthread_mutex_lock(&g_smu);
-    uint64_t bytes = own_alias_idle_drop_locked(idle, 512, &ntex);
+    uint64_t bytes = own_alias_idle_drop_locked(idle, tight ? 1024 : 512, &ntex);
     pthread_mutex_unlock(&g_smu);
-    uint32_t nvol = pkg_mark_volatile(idle < 30 ? 1500 : 7500, 48);   // ~2 s or ~10 s of Ocarina's submissions, then the system may discard the copy
-    atomic_store(&g_tu_idle_ds, 5);   // drawn-over render targets go after 0.5 s while the cap is hot (tu_pass); 3 s otherwise
+    uint32_t nvol = pkg_mark_volatile(tight ? 200 : idle < 30 ? 1500 : 7500, tight ? 256 : 48);
+    uint64_t pbytes = 0;
+    uint32_t npurge = pkg_purge_idle(tight ? 512 : 128, &pbytes);   // discard the copy now; volatile alone left 1.5 GB resident until jetsam
+    atomic_store(&g_tu_idle_ds, tight ? 2 : 5);   // drawn-over render targets: 0.2 s under 1.2 GB, else 0.5 s (tu_pass); 3 s when the cap is cold
     up_pressure_release();
     for (int i = 0; i < 32 && (n = rh_trim(1)); i++) heaps += n;
     static int lines;
-    if (lines < 40 && (ntex || heaps || nvol || lines < 3)) { lines++;
-        MLOG("iOS memory cap: GPU allocated %llu MB, headroom %llu MB (cap %d MB, headroom floor %d MB): released %u idle shared textures (%llu MB), marked %u packaged textures discardable, and %u waiting render-target heaps",
-             (unsigned long long)(gpu >> 20), (unsigned long long)(avail >> 20), cap, room, ntex, (unsigned long long)(bytes >> 20), nvol, heaps); }
+    if (lines < 40 && (ntex || heaps || nvol || npurge || lines < 3)) { lines++;
+        MLOG("iOS memory cap: GPU allocated %llu MB, headroom %llu MB (cap %d MB, headroom floor %d MB): released %u idle shared textures (%llu MB), marked %u packaged textures discardable, purged %u (%llu MB), and %u waiting render-target heaps",
+             (unsigned long long)(gpu >> 20), (unsigned long long)(avail >> 20), cap, room, ntex, (unsigned long long)(bytes >> 20), nvol, npurge, (unsigned long long)(pbytes >> 20), heaps); }
 #endif
 }
 // The R32 storage under a 32-bit colour texture that takes image atomics (tex_upgrade): resident as long as the colour view over it lives, which is what the game's names hold
@@ -3156,6 +3166,8 @@ void mtl_tex_init(const tex_t *t) {
 // Under jetsam pressure, packaged textures the game has not sampled for idle_subs submissions (Ocarina looks a texture up every submission it draws) are marked volatile.
 // The next look sets them nonvolatile and, if the system discarded the copy, uploads from the guest again. A texture the GPU has stored into stays: the guest copy is not the whole picture.
 // Finished spare copies (the previous upload) are released here too. Returns how many were marked.
+// Marking volatile does not free the copy: on an iPhone 17 Pro, 2,777 of 2,779 packaged textures were discardable and still held 1,561 MB when jetsam killed the process. pkg_purge_idle
+// sets Empty on copies that are already volatile and whose last look is older than the GPU's in-flight submissions, so the memory comes back now. The next look uploads them again.
 static uint32_t pkg_mark_volatile(uint64_t idle_subs, uint32_t max_n) {
     enum { N = 48 };
     NSMutableArray<NvPkg *> *keep = [NSMutableArray array]; id spare_drop[N]; uint32_t nd = 0;
@@ -3178,6 +3190,31 @@ static uint32_t pkg_mark_volatile(uint64_t idle_subs, uint32_t max_n) {
         if (prev == MTLPurgeableStateEmpty) pk->purged = 1;
         pk->vol = 1; did++;
     }
+    return did;
+}
+static uint32_t pkg_purge_idle(uint32_t max_n, uint64_t *bytes) {
+    enum { N = 512 };
+    if (max_n > N) max_n = N;
+    NSMutableArray<NvPkg *> *keep = [NSMutableArray array];
+    pthread_mutex_lock(&g_mu); uint64_t done = g_done, fence = g_fence; pthread_mutex_unlock(&g_mu);
+    uint64_t inflight = fence > done ? fence - done : 0;
+    pthread_mutex_lock(&g_smu);
+    for (uint32_t i = 0; i < g_pkg_share.cap && keep.count < max_n; i++) {
+        if (!g_pkg_share.vals[i]) continue;
+        NvPkg *pk = ((__bridge NvPkgRef *)g_pkg_share.vals[i])->pkg;
+        if (!pk || !pk->vol || pk->sparse || pk->ps || pk->stored || !pk->tex || pk->tex.heap || pk->purged) continue;
+        if (g_sub_serial < pk->sub || g_sub_serial - pk->sub < inflight + 32) continue;
+        [keep addObject:pk];
+    }
+    pthread_mutex_unlock(&g_smu);
+    uint32_t did = 0; uint64_t b = 0;
+    for (NvPkg *pk in keep) {
+        if (!pk->tex || !pk->vol || pk->purged) continue;
+        b += pk->tex.allocatedSize;
+        [pk->tex setPurgeableState:MTLPurgeableStateEmpty];
+        pk->purged = 1; did++;
+    }
+    if (bytes) *bytes = b;
     return did;
 }
 #endif
