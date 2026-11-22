@@ -6,6 +6,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <unistd.h>
@@ -136,6 +137,63 @@ static void guest_file_scan(const char *vec, size_t pg) {
 }
 
 static void guest_file_sweep(void);
+static _Atomic uint64_t g_gf_dirty_bytes;   // the last mincore count (guest_file_thread), for the pressure line
+static _Atomic int g_mem_hot;               // iOS memorypressure warned, until headroom recovers
+__attribute__((weak)) void mtl_mem_breakdown(char *out, size_t n) { if (out && n) out[0] = 0; }
+static int ios_headroom_mb(void) {
+    static int v = -2;
+    if (v == -2) { const char *e = getenv("DM_NVN_IOS_HEADROOM_MB"); v = e && *e ? atoi(e) : 1536; }
+    return v;
+}
+// Ask the kernel to write dirty guest-file pages back. Once clean they leave phys_footprint (the compressed set is where a dirty file page waits). MS_ASYNC does not
+// unmap them and does not wait. A no-copy Metal buffer over a pool keeps its own wiring; this only schedules the write. Chunks of 64 MB, walking the alias high water.
+static void guest_file_writeback(int chunks) {
+    if (!g_gf_n || !g_alias || chunks <= 0) return;
+    size_t hw = (size_t)atomic_load(&g_alias_hw);
+    if (hw < 65536) return;
+    static _Atomic uint64_t cursor;
+    size_t step = 64u << 20;
+    for (int i = 0; i < chunks; i++) {
+        size_t off = (size_t)(atomic_fetch_add(&cursor, step) % hw);
+        size_t n = off + step > hw ? hw - off : step;
+        msync(g_alias + off, n, MS_ASYNC);
+    }
+}
+static void mem_room_log(const char *why) {
+    static uint64_t last;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    if (last && now - last < 2000000000ull) return;
+    last = now;
+    task_vm_info_data_t vi; mach_msg_type_number_t nc = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &nc) != KERN_SUCCESS) memset(&vi, 0, sizeof vi);
+    char gfx[480]; mtl_mem_breakdown(gfx, sizeof gfx);
+    const double G = 1073741824.0;
+#if TARGET_OS_IPHONE
+    size_t avail = os_proc_available_memory();
+#else
+    size_t avail = 0;
+#endif
+    LOG("[mem] %s: headroom %llu MB, footprint %.2f GB (internal %.2f, compressed %.2f), guest file dirty %.2f GB%s%s",
+        why, (unsigned long long)(avail >> 20), vi.phys_footprint / G, vi.internal / G, vi.compressed / G, (double)atomic_load(&g_gf_dirty_bytes) / G,
+        gfx[0] ? "; " : "", gfx);
+}
+#if TARGET_OS_IPHONE
+static void mem_pressure_start(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+            DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        if (!src) return;
+        dispatch_source_set_event_handler(src, ^{
+            atomic_store(&g_mem_hot, 1);
+            if (g_gf_n) { guest_file_sweep(); guest_file_writeback(8); }
+            mem_room_log("memorypressure");
+        });
+        dispatch_resume(src);
+    });
+}
+#endif
 // The free space on the files' disk with what the system can purge on demand (caches, offloadable data): NSURLVolumeAvailableCapacityForImportantUsageKey, through CFURL, the figure an app is
 // meant to check before writing what the user asked for, and close to what Settings shows as available; f_bavail leaves that space out (on the iPad that stopped at 5.0 GB f_bavail).
 // The query asks the system's cache-delete service: 4-65 ms on the Mac, where it gave 14.73 GB for 14.71 of f_bavail (little is purgeable there). -1 when it fails
@@ -169,8 +227,15 @@ static void *guest_file_thread(void *arg) {
         if (sec % 10 == 1) {   // every 10 s, from the first second (a burst of new dirty pages between two counts is what the margin's other half is for)
             clock_gettime(CLOCK_MONOTONIC, &t0);
             dirty = vec ? guest_file_dirty(vec, pg) : -1;
+            if (dirty >= 0) atomic_store(&g_gf_dirty_bytes, (uint64_t)dirty);
             clock_gettime(CLOCK_MONOTONIC, &t1); count_ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
         }
+#if TARGET_OS_IPHONE
+        { size_t avail = os_proc_available_memory(); int room = ios_headroom_mb();
+          int low = room > 0 && avail < (size_t)room << 20;
+          if (low || atomic_load(&g_mem_hot)) { guest_file_sweep(); guest_file_writeback(low ? 4 : 1); if (sec % 10 == 0) mem_room_log("pressure"); }
+          if (!low && avail > ((size_t)room << 20) + (256u << 20)) atomic_store(&g_mem_hot, 0); }
+#endif
         double need = dirty > 0 ? dirty : 0, held = 0;
         int fs_ok = !fstatfs(g_gf_tab[0], &fs); double avail = fs_ok ? (double)fs.f_bavail * fs.f_bsize : -1, room = avail - need;
         if (fs_ok && g_gf_min_free && room < (double)g_gf_min_free) {
@@ -353,6 +418,9 @@ static void mem_init_once(void) {
         else LOG("[RED] [mem] guest file: no thread to watch it (error %d): no 10-s line, and nothing stops the game when its disk fills", rc);
     }
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p", g_as, (unsigned long long)g_reserve, g_heap, g_alias, g_stack);
+#if TARGET_OS_IPHONE
+    mem_pressure_start();
+#endif
     if ((uint64_t)(uintptr_t)g_alias > UINT64_C(1) << 39) LOG("[mem] the heap and stacks reach past 2^39, which a Switch's addresses never do: a crash on a cut-off pointer points here (DM_ALIAS_SIZE=<profile's mem_alias> keeps them lower)");
     const char *aw = getenv("DM_ALIAS_WINDOWS");
     if (aw && atoi(aw) > 0) { pthread_t th; if (!pthread_create(&th, NULL, alias_windows_thread, (void *)(uintptr_t)atoi(aw))) pthread_detach(th); }
@@ -1171,7 +1239,8 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // the SDK maps pages that are already mapped and unmaps ranges larger than what it mapped (Engage unmaps 0x1000000 and then 0x103f000 at the same address), so counting requested sizes went negative
         { int64_t d = alias_pages(off, size, commit) * 4096, before = atomic_fetch_add(&g_alias_mapped, d), after = before + d;
           pthread_mutex_unlock(&g_map_lock);
-          if (before >> 28 != after >> 28) LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB)", after / 1073741824.0, APP_POOL / 1073741824.0); }
+          if (before >> 28 != after >> 28) LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB)", after / 1073741824.0, APP_POOL / 1073741824.0);
+          if (!commit && size >= (16u << 20)) { char why[64]; snprintf(why, sizeof why, "scene give-back %zu MB", size >> 20); mem_room_log(why); } }
         regs[0] = 0; return 0;
     }
     case 0x15: {  // CreateTransferMemory(→w1 handle; x1 address, x2 size, w3 owner permission)

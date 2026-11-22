@@ -606,15 +606,18 @@ static void up_pressure_release(void);
 #endif
 // iOS jetsam kills the process with no log once phys_footprint nears the phone's limit. Past the cap, drop GPU copies nothing names any more:
 // sharing-table textures with no serial or pin, idle for a couple of seconds of submissions, and render-target heaps waiting to be reused.
-// Live textures the game still names stay. DM_NVN_IOS_GPU_CAP_MB is an optional currentAllocatedSize cap (default 0: off). DM_NVN_IOS_HEADROOM_MB
-// (default 1024) is the os_proc_available_memory floor: a free Personal Team has no increased-memory entitlement, so the real jetsam limit is whatever that call reports and the host stays 1 GB under it. Either at 0 turns that half off; both at 0 turns the pass off. The Mac has no jetsam limit of this kind
+// Live textures the game is drawing stay. DM_NVN_IOS_GPU_CAP_MB is an optional currentAllocatedSize cap (default 0: off). DM_NVN_IOS_HEADROOM_MB
+// (default 1536) is the os_proc_available_memory floor. Under it the host drops idle copies and lets the system discard packaged textures the game has not sampled. Either at 0 turns that half off; both at 0 turns the pass off. The Mac has no jetsam limit of this kind
+#if TARGET_OS_IPHONE
+static uint32_t pkg_mark_volatile(uint64_t idle_subs, uint32_t max_n);
+#endif
 static void ios_gpu_pressure(void) {
 #if TARGET_OS_IPHONE
     static int cap = -2, room = -2;
     if (cap == -2) {
         const char *e = getenv("DM_NVN_IOS_GPU_CAP_MB"), *r = getenv("DM_NVN_IOS_HEADROOM_MB");
         cap = e && *e ? atoi(e) : 0;
-        room = r && *r ? atoi(r) : 1024;
+        room = r && *r ? atoi(r) : 1536;
     }
     if (cap <= 0 && room <= 0) return;
     static uint64_t last_ns;
@@ -626,17 +629,19 @@ static void ios_gpu_pressure(void) {
     if (!((cap > 0 && gpu >= (uint64_t)cap << 20) || (room > 0 && avail < (size_t)room << 20))) { atomic_store(&g_tu_idle_ds, 0); return; }
     unsigned heaps = 0, n;
     for (int i = 0; i < 32 && (n = rh_trim(1)); i++) heaps += n;
+    uint64_t idle = avail < (256u << 20) ? 1 : avail < ((size_t)room << 19) ? 30 : 200;   // room/2: shed unheld copies within a second; under 256 MB, at once
     uint32_t ntex = 0;
     pthread_mutex_lock(&g_smu);
-    uint64_t bytes = own_alias_idle_drop_locked(200, 512, &ntex);
+    uint64_t bytes = own_alias_idle_drop_locked(idle, 512, &ntex);
     pthread_mutex_unlock(&g_smu);
+    uint32_t nvol = pkg_mark_volatile(idle < 30 ? 1500 : 7500, 48);   // ~2 s or ~10 s of Ocarina's submissions, then the system may discard the copy
     atomic_store(&g_tu_idle_ds, 5);   // drawn-over render targets go after 0.5 s while the cap is hot (tu_pass); 3 s otherwise
     up_pressure_release();
     for (int i = 0; i < 32 && (n = rh_trim(1)); i++) heaps += n;
     static int lines;
-    if (lines < 40 && (ntex || heaps || lines < 3)) { lines++;
-        MLOG("iOS memory cap: GPU allocated %llu MB, headroom %llu MB (cap %d MB, headroom floor %d MB): released %u idle shared textures (%llu MB) and %u waiting render-target heaps",
-             (unsigned long long)(gpu >> 20), (unsigned long long)(avail >> 20), cap, room, ntex, (unsigned long long)(bytes >> 20), heaps); }
+    if (lines < 40 && (ntex || heaps || nvol || lines < 3)) { lines++;
+        MLOG("iOS memory cap: GPU allocated %llu MB, headroom %llu MB (cap %d MB, headroom floor %d MB): released %u idle shared textures (%llu MB), marked %u packaged textures discardable, and %u waiting render-target heaps",
+             (unsigned long long)(gpu >> 20), (unsigned long long)(avail >> 20), cap, room, ntex, (unsigned long long)(bytes >> 20), nvol, heaps); }
 #endif
 }
 // The R32 storage under a 32-bit colour texture that takes image atomics (tex_upgrade): resident as long as the colour view over it lives, which is what the game's names hold
@@ -3130,7 +3135,7 @@ void mtl_tex_init(const tex_t *t) {
 // Host record of a packaged texture: the current MTLTexture, the upload stamp, and the global write generation at the last check
 // spare: the texture the last re-upload replaced, kept resident and written by the next re-upload once the GPU has passed spare_fence (a texture the CPU rewrites every frame, a movie frame,
 // alternates between two textures instead of allocating one per frame: Link's Awakening's title movie made and freed an 8 MB texture a frame)
-@interface NvPkg : NSObject { @public id<MTLTexture> tex, spare, view; uint64_t stamp, seen, hash, spare_fence, vgen, vseen, sub, own, lost_gen; const void *span; int sparse, vbase, part; uint8_t *edge[2]; uint32_t edge_n[2], stored; id ps; id<MTLBuffer> eb; uint64_t *ph, up_frame, up_sub; uint32_t nph, missed; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK; span: its tracked range (nvn_dirty_span, NULL = untracked);
+@interface NvPkg : NSObject { @public id<MTLTexture> tex, spare, view; uint64_t stamp, seen, hash, spare_fence, vgen, vseen, sub, own, lost_gen; const void *span; int sparse, vbase, part; uint8_t *edge[2]; uint32_t edge_n[2], stored; id ps; id<MTLBuffer> eb; uint64_t *ph, up_frame, up_sub; uint32_t nph, missed; uint8_t vol, purged; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK; span: its tracked range (nvn_dirty_span, NULL = untracked); vol: the system may discard tex; purged: it did, so the next use uploads again
 // sparse: in a sparse virtual pool, read through its page table (hle_nvn.c nvn_sparse_*), vgen the page table's generation at the upload and vseen at the last look; view: what it is bound as (sparse_view)
 // ps: its placement sparse texture (NvSparse, sparse_make), which tex is: mapped and uploaded tile by tile (sparse_sync)
 // edge: the uploaded bytes of the storage's first and last host pages where other data shares them (pkg_edges_take); in eb from the first GPU store into its storage on (pkg_edges_gpu),
@@ -3147,6 +3152,42 @@ void mtl_tex_init(const tex_t *t) {
 // 2.0 GB, and an upload per serial took 6 GB, past what a 16 GB Mac can keep wired once the pools are added. A new serial with the same storage and description takes the same NvPkg, so its
 // dirty-page checks and re-uploads are one. Weak: the serials' entries own it, and a table entry never keeps one alive. Under g_smu; a pool's entries go when it is finalized (mtl_alias_drop_pool)
 @interface NvPkgRef : NSObject { @public __weak NvPkg *pkg; } @end
+#if TARGET_OS_IPHONE
+// Under jetsam pressure, packaged textures the game has not sampled for idle_subs submissions (Ocarina looks a texture up every submission it draws) are marked volatile.
+// The next look sets them nonvolatile and, if the system discarded the copy, uploads from the guest again. A texture the GPU has stored into stays: the guest copy is not the whole picture.
+// Finished spare copies (the previous upload) are released here too. Returns how many were marked.
+static uint32_t pkg_mark_volatile(uint64_t idle_subs, uint32_t max_n) {
+    enum { N = 48 };
+    NSMutableArray<NvPkg *> *keep = [NSMutableArray array]; id spare_drop[N]; uint32_t nd = 0;
+    pthread_mutex_lock(&g_mu); uint64_t done = g_done; pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_smu);
+    for (uint32_t i = 0; i < g_pkg_share.cap && keep.count < max_n && keep.count < N; i++) {
+        if (!g_pkg_share.vals[i]) continue;
+        NvPkg *pk = ((__bridge NvPkgRef *)g_pkg_share.vals[i])->pkg;
+        if (!pk || pk->sparse || pk->ps || pk->stored || pk->vol || !pk->tex || pk->tex.heap) continue;
+        if (g_sub_serial < pk->sub || g_sub_serial - pk->sub < idle_subs) continue;
+        [keep addObject:pk];
+        if (nd < N && pk->spare && pk->spare_fence <= done) { spare_drop[nd++] = pk->spare; pk->spare = nil; }
+    }
+    pthread_mutex_unlock(&g_smu);
+    for (uint32_t i = 0; i < nd; i++) defer_obj_release(spare_drop[i]);
+    uint32_t did = 0;
+    for (NvPkg *pk in keep) {
+        if (!pk->tex || pk->vol) continue;
+        MTLPurgeableState prev = [pk->tex setPurgeableState:MTLPurgeableStateVolatile];
+        if (prev == MTLPurgeableStateEmpty) pk->purged = 1;
+        pk->vol = 1; did++;
+    }
+    return did;
+}
+#endif
+// 1 when the system discarded a volatile packaged texture. The caller uploads it again from the guest.
+static int pkg_reclaim(NvPkg *pk) {
+    if (!pk || !pk->vol || pk->sparse || !pk->tex) { if (pk) pk->vol = 0; return pk && pk->purged; }
+    pk->vol = 0;
+    if ([pk->tex setPurgeableState:MTLPurgeableStateNonVolatile] == MTLPurgeableStateEmpty) pk->purged = 1;
+    return pk->purged;
+}
 @implementation NvPkgRef @end
 void mtl_alias_drop_pool(const void *pool) {
     if (!pool) return;
@@ -5424,6 +5465,7 @@ static void *tex_mtl_resolve(const tex_t *ct, int *in_storage, id<MTLTexture> __
         // Any other thread (the present thread) uses an uploaded one as it is: a present shows the content as of when the game queued it, which present_enqueue resolved there. Its
         // pages and mappings are not looked at here, so the submit thread's next look still finds a write since (pk->seen stays)
         if (off) {
+            if (pk && pkg_reclaim(pk)) return NULL;   // the system discarded it: the submit thread uploads it again, this look does not show an empty copy
             if (pk) return tex_mtl_result(pk->ps ? pk->tex : pk->view ? pk->view : pk->tex, owned);
             RED_ONCE(168, "texture ser=%llu taken from its storage resolved first off the submit thread: no host texture until the submit thread uploads it", (unsigned long long)t->serial);
             return NULL;
@@ -5432,7 +5474,9 @@ static void *tex_mtl_resolve(const tex_t *ct, int *in_storage, id<MTLTexture> __
         if (!pk) { id<MTLTexture> made = nil; NvSparse *ps = sparse_make(t, 0, &made);
             if (ps) { pk = [NvPkg new]; pk->ps = ps; pk->tex = made; pk->sparse = 1; sparse_sync(ps, t, 1); tex_put(t->serial, pk); return tex_mtl_result(pk->tex, owned); } }
         if (pk) {   // Already uploaded: check the covered pages only if there has been a guest write since the last check
-            if (gsb_held(t->mem, t->L.size)) return tex_mtl_result(pk->view ? pk->view : pk->tex, owned);   // its storage lacks a GPU write this command buffer stores through any texture over those bytes (gsb_store): uploaded at its next use if the CPU wrote it
+            int force_up = pkg_reclaim(pk) || pk->purged;
+            if (force_up) { pk->purged = 0; static int np; if (np++ < 20) MLOG("packaged texture re-upload: the system discarded its copy ser=%llu (%d so far)", (unsigned long long)t->serial, np); }
+            if (!force_up && gsb_held(t->mem, t->L.size)) return tex_mtl_result(pk->view ? pk->view : pk->tex, owned);   // its storage lacks a GPU write this command buffer stores through any texture over those bytes (gsb_store): uploaded at its next use if the CPU wrote it
             uint64_t now = nvn_dirty_now(), own = nvn_dirty_own_writes();
             int tracked = pk->span != NULL;   // kept from the upload: a texture's pool stays registered while the texture lives
             // Looked at already in this submission: it keeps that look's texture. The queue's thread replays a submission after the game queued it, so the writes the game made
@@ -5447,14 +5491,15 @@ static void *tex_mtl_resolve(const tex_t *ct, int *in_storage, id<MTLTexture> __
             int clean = !written || kept;
             // Only the pages it shares with other data, its bytes there as uploaded: clean, and no write generation started for a neighbour's writes (pkg_edges_clean protects
             // the storage again, so not while a page inside it is being written)
-            if (kept && (pk->edge_n[0] || pk->edge_n[1]) && !pkg_inner_written(pk, t) && pkg_edges_clean(pk, t)) return tex_mtl_result(pk->view ? pk->view : pk->tex, owned);
+            if (!force_up && kept && (pk->edge_n[0] || pk->edge_n[1]) && !pkg_inner_written(pk, t) && pkg_edges_clean(pk, t)) return tex_mtl_result(pk->view ? pk->view : pk->tex, owned);
             if (kept) { now = pk->seen; g_pkg_kept = 1; } else if (!pk->sparse) { pk->sub = g_sub_serial; pk->own = own; }
             // Checked already in this submission: seen and vseen stay those of that check, so a write or a mapping another thread makes during the replay is found at the next submission's
             if (pk->sparse && sparse_checked(pk)) { clean = 1; now = pk->seen; }
             else if (pk->sparse) { uint64_t g = nvn_sparse_gen(); clean = (now == pk->seen && g == pk->vseen) || !nvn_sparse_since(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size, pk->vgen, pk->stamp); pk->vseen = g; pk->sub = g_sub_serial; pk->own = own; }
             pk->seen = now;
             // Images copied from a predecessor are only as good as its upload, and the report of a dropped batch comes after later uploads were encoded
-            int whole = pk->part && pk->lost_gen != atomic_load(&g_up_lost_gen);
+            int whole = (pk->part && pk->lost_gen != atomic_load(&g_up_lost_gen)) || force_up;
+            if (force_up) clean = 0;
             if (whole && clean) { clean = 0; static int nl; if (nl++ < 8) MLOG("re-uploading a texture holding images copied from one uploaded before a batch was dropped ser=%llu", (unsigned long long)t->serial); }
             if (!clean && atomic_load_explicit(&g_up_lost_n, memory_order_relaxed) && up_lost_take(pk->tex)) whole = 1;
             if (clean && atomic_load_explicit(&g_up_lost_n, memory_order_relaxed) && up_lost_take(pk->tex)) { clean = 0; whole = 1; uint64_t k = atomic_load(&g_up_lost_redo); if (k <= 3 || !atomic_load(&g_up_lost_n)) MLOG("re-uploading a texture whose upload was dropped ser=%llu (%llu in total, %d left in the record)", (unsigned long long)t->serial, (unsigned long long)k, atomic_load(&g_up_lost_n)); }
@@ -5635,6 +5680,24 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
       if (gw) MLOG("raw pool table words at commit: %llu, of them %llu held an older table than the current one and %llu the current one behind the pools", (unsigned long long)gw, (unsigned long long)go, (unsigned long long)gb); }
     if (g_gptr_bindings) MLOG("raw pointer discovery up to frame %llu: %llu bindings, %llu pointer words read, %llu previously unaddressed ranges (%llu logical MB)", frame,
                             (unsigned long long)g_gptr_bindings, (unsigned long long)g_gptr_reads, (unsigned long long)g_gptr_added, (unsigned long long)(g_gptr_bytes >> 20));
+}
+void mtl_mem_breakdown(char *out, size_t n) {
+    if (!out || !n) return;
+    uint64_t gpu = g_dev ? g_dev.currentAllocatedSize : 0, up = 0, pk_b = 0; unsigned pk_n = 0, pk_vol = 0;
+    for (int s = 0; s < 3; s++) { if (g_up_slot_blk[s]) up += g_up_slot_blk[s].length; if (g_up_slot_over[s]) up += g_up_slot_over[s].length; }
+    pthread_mutex_lock(&g_smu);
+    own_alias_unheld au = own_alias_unheld_locked();
+    for (uint32_t i = 0; i < g_pkg_share.cap; i++) {
+        if (!g_pkg_share.vals[i]) continue;
+        NvPkg *pk = ((__bridge NvPkgRef *)g_pkg_share.vals[i])->pkg;
+        if (!pk || !pk->tex) continue;
+        pk_n++; if (pk->vol) pk_vol++; pk_b += pk->tex.allocatedSize;
+    }
+    pthread_mutex_unlock(&g_smu);
+    os_unfair_lock_lock(&g_rh_lk); unsigned rh_n = g_rh_n; uint64_t rh_b = g_rh_bytes; os_unfair_lock_unlock(&g_rh_lk);
+    snprintf(out, n, "GPU %llu MB, idle shared %llu MB (%u), packaged %u (%llu MB, %u discardable), upload staging %llu MB, waiting render-target heaps %u (%llu MB)",
+             (unsigned long long)(gpu >> 20), (unsigned long long)(au.bytes >> 20), au.entries, pk_n, (unsigned long long)(pk_b >> 20), pk_vol,
+             (unsigned long long)(up >> 20), rh_n, (unsigned long long)(rh_b >> 20));
 }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
 uint64_t mtl_pkg_edge_skips(void) { return g_pkg_edge_skips; }
@@ -12376,9 +12439,9 @@ static int pool_size_cmp(const void *a, const void *b) { uint64_t x = *(const ui
 static uint64_t pool_budget(void) {
     uint64_t cap = g_dev.recommendedMaxWorkingSetSize / 20;
 #if TARGET_OS_IPHONE
-    // Leave DM_NVN_IOS_HEADROOM_MB (default 1 GB) before jetsam. Once the process is inside that margin, the walk makes no more optional textures.
+    // Leave DM_NVN_IOS_HEADROOM_MB (default 1.5 GB) before jetsam. Once the process is inside that margin, the walk makes no more optional textures.
     static int floor_mb = -2;
-    if (floor_mb == -2) { const char *e = getenv("DM_NVN_IOS_HEADROOM_MB"); floor_mb = e && *e ? atoi(e) : 1024; }
+    if (floor_mb == -2) { const char *e = getenv("DM_NVN_IOS_HEADROOM_MB"); floor_mb = e && *e ? atoi(e) : 1536; }
     if (floor_mb > 0) {
         uint64_t avail = os_proc_available_memory(), floor = (uint64_t)floor_mb << 20;
         if (avail <= floor) return g_dev.currentAllocatedSize;
