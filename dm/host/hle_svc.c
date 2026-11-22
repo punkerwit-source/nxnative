@@ -147,13 +147,13 @@ static int ios_headroom_mb(void) {
 }
 // Ask the kernel to write dirty guest-file pages back. Once clean they leave phys_footprint: the compressed set is where a dirty file page waits, and on a long
 // Ocarina session that set sat near 3.7 GB while mincore still saw about 2 GB dirty. The heap is the part the game keeps mapped; walking only the alias left it compressed.
-// MS_ASYNC schedules the write. sync_one forces the first chunk through (MS_SYNC) so the kernel cannot leave it compressed until jetsam. A no-copy Metal buffer over a pool
+// MS_ASYNC schedules the write. sync_n forces that many leading chunks through (MS_SYNC). A no-copy Metal buffer over a pool
 // keeps its own wiring. Chunks of 64 MB, heap first, then the alias high water. A chunk with a hole (PROT_NONE) can fail; the next chunk still runs.
 static void msync_span(uint8_t *p, size_t n, int flags) {
     if (!p || n < 4096) return;
     if (msync(p, n, flags)) { static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 3) LOG("[RED] [mem] guest file writeback %zu MB failed (errno %d)", n >> 20, errno); }
 }
-static void guest_file_writeback(int chunks, int sync_one) {
+static void guest_file_writeback(int chunks, int sync_n) {
     if (!g_gf_n || chunks <= 0) return;
     size_t heap_n = g_heap ? atomic_load(&g_heap_cur) : 0, alias_n = g_alias ? (size_t)atomic_load(&g_alias_hw) : 0, span = heap_n + alias_n;
     if (span < 65536) return;
@@ -161,7 +161,7 @@ static void guest_file_writeback(int chunks, int sync_one) {
     size_t step = 64u << 20;
     for (int i = 0; i < chunks; i++) {
         size_t off = (size_t)(atomic_fetch_add(&cursor, step) % span);
-        int flags = (sync_one && i == 0) ? MS_SYNC : MS_ASYNC;
+        int flags = i < sync_n ? MS_SYNC : MS_ASYNC;
         if (off < heap_n) {
             size_t n = off + step > heap_n ? heap_n - off : step;
             msync_span(g_heap + off, n, flags);
@@ -198,6 +198,24 @@ void mem_headroom_watch(void) {   // a submission while the last sample was alre
     size_t avail = os_proc_available_memory();
     if (avail >= (400u << 20)) return;
     mem_room_log_at("headroom under 400 MB", 1);
+}
+// Headroom under 300 MB (nvn_mtl.m, before a residency commit). MS_SYNC the opened heap, which is the stable dirty set, and up to 1 GB of the alias.
+// MS_ASYNC of 512 MB/s does not drain a 3.8 GB compressor that is already ahead of mincore: the 1938 log shows compressed at 3.3 GB while dirty reads 0.
+void mem_emergency_sync(void) {
+    if (!g_gf_n) return;
+    size_t heap_n = g_heap ? atomic_load(&g_heap_cur) : 0, step = 64u << 20;
+#ifdef MADV_PAGEOUT
+    if (g_heap && heap_n >= 4096) madvise(g_heap, heap_n, MADV_PAGEOUT);
+#endif
+    for (size_t off = 0; off < heap_n; off += step) msync_span(g_heap + off, off + step > heap_n ? heap_n - off : step, MS_SYNC);
+    size_t alias_n = g_alias ? (size_t)atomic_load(&g_alias_hw) : 0, lim = alias_n < (1ull << 30) ? alias_n : (1ull << 30);
+    static _Atomic uint64_t cursor;
+    for (size_t done = 0; done < lim && alias_n; done += step) {
+        size_t off = (size_t)(atomic_fetch_add(&cursor, step) % alias_n);
+        size_t n = off + step > alias_n ? alias_n - off : step;
+        msync_span(g_alias + off, n, MS_SYNC);
+    }
+    mem_room_log_at("emergency sync", 1);
 }
 static void mem_pressure_start(void) {
     static dispatch_once_t once;
@@ -260,7 +278,9 @@ static void *guest_file_thread(void *arg) {
           if (low || atomic_load(&g_mem_hot) || dirty_b > (512ull << 20)) {
               if (low || atomic_load(&g_mem_hot)) guest_file_sweep();
               int chunks = tight || dirty_b > (1ull << 30) ? 8 : 4;
-              guest_file_writeback(chunks, tight || atomic_load(&g_mem_hot));
+              int sync_n = tight || atomic_load(&g_mem_hot) ? 4 : dirty_b > (1ull << 30) ? 2 : 0;
+              if (sync_n > chunks) sync_n = chunks;
+              guest_file_writeback(chunks, sync_n);
               if (low && (tight ? sec % 2 == 0 : sec % 10 == 0)) mem_room_log("pressure");
           }
           if (!low && avail > ((size_t)room << 20) + (256u << 20)) atomic_store(&g_mem_hot, 0); }

@@ -612,7 +612,74 @@ static void up_pressure_release(void);
 static uint32_t pkg_mark_volatile(uint64_t idle_subs, uint32_t max_n);
 static uint32_t pkg_purge_idle(uint32_t max_n, uint64_t *bytes);
 __attribute__((weak)) void mem_headroom_watch(void) {}
+__attribute__((weak)) void mem_emergency_sync(void) {}
 static int g_ios_hot;
+// Bytes to free before wiring `incoming` more, so headroom stays at or above 600 MB. Back-to-back commits (the 1938 log's four
+// residency adds, 1.3 GB, with os_proc_available_memory still reading 1018 MB) pass the headroom after earlier adds in this burst.
+// Kept in step with dm/tools/tests/test_ios_room.py.
+static uint64_t mem_bytes_to_free(uint64_t headroom, uint64_t incoming) {
+    const uint64_t keep = 600ull << 20, danger = 300ull << 20, tight = 1200ull << 20, floor = 1536ull << 20;
+    if (headroom < danger) return keep + incoming > headroom ? keep + incoming - headroom : 0;
+    if (headroom >= tight && incoming < (64ull << 20)) return 0;
+    if (headroom < floor && headroom < keep + incoming) return keep + incoming - headroom;
+    if (incoming >= (128ull << 20) && headroom < keep + incoming) return keep + incoming - headroom;
+    return 0;
+}
+static _Atomic uint64_t g_ios_sample_ns, g_ios_sample_room, g_ios_charged;
+static uint64_t ios_effective_headroom(void) {
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), sample_ns = atomic_load(&g_ios_sample_ns);
+    size_t live = os_proc_available_memory();
+    if (!sample_ns || now - sample_ns > 2000000000ull) {
+        atomic_store(&g_ios_sample_ns, now); atomic_store(&g_ios_sample_room, (uint64_t)live); atomic_store(&g_ios_charged, 0);
+        return live;
+    }
+    uint64_t room = atomic_load(&g_ios_sample_room), charged = atomic_load(&g_ios_charged);
+    uint64_t eff = room > charged ? room - charged : 0;
+    if ((uint64_t)live < eff) { atomic_store(&g_ios_sample_room, (uint64_t)live); atomic_store(&g_ios_charged, 0); return live; }
+    return eff;
+}
+static void ios_charge(uint64_t incoming, uint64_t freed) {
+    if (freed >= incoming) {
+        uint64_t extra = freed - incoming, c = atomic_load(&g_ios_charged);
+        while (c && !atomic_compare_exchange_weak(&g_ios_charged, &c, c > extra ? c - extra : 0)) {}
+    } else atomic_fetch_add(&g_ios_charged, incoming - freed);
+}
+// Before a residency commit wires `incoming` bytes. Purges idle packaged copies until that add still leaves 600 MB, and fully syncs guest files under 300 MB.
+static void ios_make_room(uint64_t incoming) {
+    if (!g_dev) return;
+    uint64_t eff = ios_effective_headroom();
+    uint64_t need = mem_bytes_to_free(eff, incoming);
+    int emergency = eff < (300ull << 20);
+    if (!need && !emergency) { if (incoming) ios_charge(incoming, 0); return; }
+    unsigned heaps = 0, n;
+    for (int i = 0; i < 32 && (n = rh_trim(1)); i++) heaps += n;
+    uint64_t idle = emergency ? 8 : 60;   // about two frames; the 8-second idle left 1.8 GB of packaged copies resident through the burst
+    pkg_mark_volatile(idle, 2048);
+    uint64_t freed = 0;
+    for (int pass = 0; pass < 8 && freed < need; pass++) {
+        uint64_t b = 0; uint32_t got = pkg_purge_idle(512, &b);
+        freed += b;
+        if (!got) break;
+    }
+    if (freed < need && !emergency) {   // the short idle was not enough: anything not in the in-flight window
+        pkg_mark_volatile(8, 2048);
+        for (int pass = 0; pass < 8 && freed < need; pass++) {
+            uint64_t b = 0; uint32_t got = pkg_purge_idle(512, &b);
+            freed += b;
+            if (!got) break;
+        }
+    }
+    up_pressure_release();
+    for (int i = 0; i < 32 && (n = rh_trim(1)); i++) heaps += n;
+    uint64_t after = eff + freed > incoming ? eff + freed - incoming : 0;
+    if (emergency || after < (300ull << 20)) mem_emergency_sync();
+    ios_charge(incoming, freed);
+    static int lines;
+    if (lines < 30 || emergency) { lines++;
+        MLOG("[mem] room: headroom %llu MB, residency add %llu MB: purged %llu MB (%u waiting heaps)%s",
+             (unsigned long long)(eff >> 20), (unsigned long long)(incoming >> 20), (unsigned long long)(freed >> 20), heaps,
+             emergency || after < (300ull << 20) ? ", emergency guest-file sync" : ""); }
+}
 #endif
 static void ios_gpu_pressure(void) {
 #if TARGET_OS_IPHONE
@@ -642,7 +709,7 @@ static void ios_gpu_pressure(void) {
     pthread_mutex_lock(&g_smu);
     uint64_t bytes = own_alias_idle_drop_locked(idle, tight ? 1024 : 512, &ntex);
     pthread_mutex_unlock(&g_smu);
-    uint32_t nvol = pkg_mark_volatile(tight ? 200 : idle < 30 ? 1500 : 7500, tight ? 256 : 48);
+    uint32_t nvol = pkg_mark_volatile(tight ? 60 : idle < 30 ? 1500 : 7500, tight ? 2048 : 48);
     uint64_t pbytes = 0;
     uint32_t npurge = pkg_purge_idle(tight ? 512 : 128, &pbytes);   // discard the copy now; volatile alone left 1.5 GB resident until jetsam
     atomic_store(&g_tu_idle_ds, tight ? 2 : 5);   // drawn-over render targets: 0.2 s under 1.2 GB, else 0.5 s (tu_pass); 3 s when the cap is cold
@@ -688,6 +755,16 @@ static void res_check(id r, const char *what, int reg) {
 // done. Each change holds its allocation until it is committed, so a removed one stays alive until it has left the set.
 // Upload staging is queued with the commit lock held so this caller also owns the removal references through their release.
 static void res_commit_retiring(NSArray<id<MTLAllocation>> *staging) { @autoreleasepool {
+#if TARGET_OS_IPHONE
+    uint64_t add_b = 0, rem_b = 0;
+    pthread_mutex_lock(&g_res_mu);
+    for (size_t i = 0; i < g_res_qn; i++) {
+        uint64_t z = ((__bridge id<MTLAllocation>)g_res_q[i].o).allocatedSize;
+        if (g_res_q[i].add) add_b += z; else rem_b += z;
+    }
+    pthread_mutex_unlock(&g_res_mu);
+    ios_make_room(add_b > rem_b ? add_b - rem_b : 0);
+#endif
     pthread_mutex_lock(&g_res_commit_mu);
     if (staging) for (id<MTLAllocation> obj in staging) res_remove(obj);
     pthread_mutex_lock(&g_res_mu);
@@ -3169,17 +3246,18 @@ void mtl_tex_init(const tex_t *t) {
 // Marking volatile does not free the copy: on an iPhone 17 Pro, 2,777 of 2,779 packaged textures were discardable and still held 1,561 MB when jetsam killed the process. pkg_purge_idle
 // sets Empty on copies that are already volatile and whose last look is older than the GPU's in-flight submissions, so the memory comes back now. The next look uploads them again.
 static uint32_t pkg_mark_volatile(uint64_t idle_subs, uint32_t max_n) {
-    enum { N = 48 };
-    NSMutableArray<NvPkg *> *keep = [NSMutableArray array]; id spare_drop[N]; uint32_t nd = 0;
+    enum { N = 2048, SPARE = 48 };
+    if (max_n > N) max_n = N;
+    NSMutableArray<NvPkg *> *keep = [NSMutableArray array]; id spare_drop[SPARE]; uint32_t nd = 0;
     pthread_mutex_lock(&g_mu); uint64_t done = g_done; pthread_mutex_unlock(&g_mu);
     pthread_mutex_lock(&g_smu);
-    for (uint32_t i = 0; i < g_pkg_share.cap && keep.count < max_n && keep.count < N; i++) {
+    for (uint32_t i = 0; i < g_pkg_share.cap && keep.count < max_n; i++) {
         if (!g_pkg_share.vals[i]) continue;
         NvPkg *pk = ((__bridge NvPkgRef *)g_pkg_share.vals[i])->pkg;
         if (!pk || pk->sparse || pk->ps || pk->stored || pk->vol || !pk->tex || pk->tex.heap) continue;
         if (g_sub_serial < pk->sub || g_sub_serial - pk->sub < idle_subs) continue;
         [keep addObject:pk];
-        if (nd < N && pk->spare && pk->spare_fence <= done) { spare_drop[nd++] = pk->spare; pk->spare = nil; }
+        if (nd < SPARE && pk->spare && pk->spare_fence <= done) { spare_drop[nd++] = pk->spare; pk->spare = nil; }
     }
     pthread_mutex_unlock(&g_smu);
     for (uint32_t i = 0; i < nd; i++) defer_obj_release(spare_drop[i]);
