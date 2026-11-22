@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <mach/mach.h>
+#include <TargetConditionals.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
@@ -568,6 +569,8 @@ static void hitch_grab(thr_t *t, hitch_t *h) {
     }
     thread_resume(t->mport);
 }
+static void hitch_hosts(void);
+__attribute__((weak)) void mtl_freeze_dump(void) {}
 static void hitch_log(const hitch_t *h) {
     static const char *kinds[] = {"run", "mutex", "condvar", "address", "sync"};
     char w[900]; size_t q = 0, n = sizeof w; w[0] = 0;
@@ -603,13 +606,46 @@ static void *hitch_main(void *arg) {
         int nt = 0;
         g_lock(); for (thr_t *t = g_all; t && nt < 256; t = t->all) if (t->started && !t->exited) hitch_grab(t, &hs[nt++]); g_unlock();
         for (int k = 0; k < nt; k++) hitch_log(&hs[k]);
+        hitch_hosts();
+        mtl_freeze_dump();
     }
     return NULL;
 }
+// Host threads (present, archive writer, compiles, audio): the guest table does not have them. Suspended only long enough to read the frame chain.
+static void hitch_hosts(void) {
+    thread_act_array_t ths; mach_msg_type_number_t nth = 0;
+    if (task_threads(mach_task_self(), &ths, &nth) != KERN_SUCCESS) return;
+    for (mach_msg_type_number_t i = 0; i < nth; i++) {
+        int guest = 0; g_lock(); for (thr_t *t = g_all; t; t = t->all) if (t->mport == ths[i]) { guest = 1; break; } g_unlock();
+        if (guest || ths[i] == mach_thread_self() || thread_suspend(ths[i]) != KERN_SUCCESS) { mach_port_deallocate(mach_task_self(), ths[i]); continue; }
+        arm_thread_state64_t st; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(ths[i], ARM_THREAD_STATE64, (thread_state_t)&st, &c) == KERN_SUCCESS) {
+            char line[1200]; int p = snprintf(line, sizeof line, "[dm] host thread %#x:", ths[i]);
+            uint64_t fp = __darwin_arm_thread_state64_get_fp(st), pc = __darwin_arm_thread_state64_get_pc(st);
+            for (int k = 0; k < 12 && p < (int)sizeof line - 80; k++) {
+                Dl_info di; module_t *m = module_of((void *)pc);
+                if (m) p += snprintf(line + p, sizeof line - p, " %s+%#llx", m->name, (unsigned long long)(pc - (uint64_t)m->base));
+                else if (dladdr((void *)pc, &di) && di.dli_sname) p += snprintf(line + p, sizeof line - p, " %s+%#lx", di.dli_sname, (unsigned long)(pc - (uint64_t)di.dli_saddr));
+                else p += snprintf(line + p, sizeof line - p, " %#llx", (unsigned long long)pc);
+                uint64_t fr[2]; vm_size_t got = 0;
+                if (!fp || vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &got) || got != 16 || fr[0] <= fp) break;
+                fp = fr[0]; pc = fr[1];
+            }
+            fprintf(stderr, "%s\n", line);
+        }
+        thread_resume(ths[i]);
+        mach_port_deallocate(mach_task_self(), ths[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)ths, nth * sizeof *ths);
+}
 static void hitch_init(void) {
-    const char *e = getenv("DM_HITCH_DUMP"); if (!e || atoi(e) <= 0) return;
+    const char *e = getenv("DM_HITCH_DUMP");
+#if TARGET_OS_IPHONE
+    if (!e) e = "3000";   // a frozen picture with the app still alive: one dump, then again only after a present and another stall. DM_HITCH_DUMP=0 turns it off
+#endif
+    if (!e || atoi(e) <= 0) return;
     pthread_t th; pthread_create(&th, NULL, hitch_main, (void *)e); pthread_detach(th);
-    LOG("DM_HITCH_DUMP=%s: the guest threads are logged when no frame is presented for that many ms", e);
+    LOG("DM_HITCH_DUMP=%s: threads are logged when no frame is presented for that many ms", e);
 }
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 uint32_t svc_thread_main_init(void) {

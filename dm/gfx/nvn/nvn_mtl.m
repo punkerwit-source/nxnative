@@ -10413,8 +10413,10 @@ static void plain_compile_begin(void) { ser_compile_enter(1); }
 static void ser_compile_leave(int plain) { pthread_mutex_lock(&g_ser_mu); g_ser_plain -= plain; if (!--g_ser_compiles && g_ser_want) pthread_cond_broadcast(&g_ser_cv); pthread_mutex_unlock(&g_ser_mu); }
 static void ser_compile_end(void) { ser_compile_leave(0); }
 static void plain_compile_end(void) { ser_compile_leave(1); }
-// A stuck capture must not stop every later compile behind a waiting write: after SER_WAIT_MS the write can proceed beside captures of other periods. An unresolved plain compile
-// could still report service death, so the writer drops its period instead. New compiles stay held back until ser_end. Returns the unresolved plain count under that exclusion
+// A stuck capture must not stop every later compile behind a waiting write: after SER_WAIT_MS the writer gives up. It does not serialize beside a compile that is still inside
+// Metal. That overlap frees compiled-binary cache entries the compile is reading, and on iOS the picture then stops with no error (Ocarina of Time, HDMI, frame 29679, the log's
+// last line a 7-pipeline write). An unresolved plain compile could still report service death, so that period is dropped too. New compiles stay held back until ser_end.
+// Returns the number of compiles still inside Metal. Non-zero: do not write.
 enum { SER_WAIT_MS = 2000 };
 static int ser_begin(void) {
     pthread_mutex_lock(&g_ser_mu); g_ser_want++;
@@ -10422,9 +10424,8 @@ static int ser_begin(void) {
     if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
     while (g_ser_compiles && pthread_cond_timedwait(&g_ser_cv, &g_ser_mu, &until) != ETIMEDOUT) {}
     int left = g_ser_compiles, plain = g_ser_plain; pthread_mutex_unlock(&g_ser_mu);
-    static _Atomic int told; if (left && !atomic_exchange(&told, 1)) MLOG("pipeline archive: %d compiles still under way after %d ms (%d plain): %s", left, SER_WAIT_MS, plain,
-        plain ? "the period is not written before those compiles report their errors" : "the write goes ahead beside captures of other periods (Metal may crash on that, see ser_begin)");
-    return plain;
+    if (left) MLOG("[RED] pipeline archive: %d compiles still inside Metal after %d ms (%d plain): this period is not written", left, SER_WAIT_MS, plain);
+    return left;
 }
 // An optional windowed write must be ready to serialize now. Leave the current period in place if play has resumed or any compile is still under way.
 static int ser_try_begin(void) {
@@ -10860,15 +10861,15 @@ static void arch_write(ArchEpoch *ep, int gate_held) {
 static void arch_write_file(ArchEpoch *ep, int gate_held) {
     int n = atomic_load(&ep->n), vd = atomic_load(&ep->vd), cs = atomic_load(&ep->cs), ms = atomic_load(&ep->ms);   // exact: no compile of the period is under way
     if (!n) { if (gate_held) ser_end(); return; }
-    int plain = gate_held ? 0 : ser_begin();   // a plain compile may report service death only after Metal's retries: an expired wait cannot certify this period
+    int blocked = gate_held ? 0 : ser_begin();   // non-zero: a compile is still inside Metal. Writing beside it hangs or crashes the compiler (ser_begin)
     int crashed = atomic_load(&ep->crashed) || ep->deaths != atomic_load(&g_arch_deaths);
-    if (crashed || plain) {
+    if (crashed || blocked) {
         ser_end();
         atomic_fetch_sub(&g_arch_new, n); atomic_fetch_sub(&g_arch_new_vd, vd);
         if (ep->compacting) g_compact_bad = 1;   // the old files keep the bases this period would have held
         if (crashed) MLOG("[RED] pipeline archive: a flush period the compiler service died in is not written (%d pipelines: %d bases, %d compute, %d task / mesh); they are captured again at a later start",
                           n, n - cs - ms, cs, ms);
-        else MLOG("pipeline archive: a flush period with %d unfinished plain compiles is not written (%d pipelines); their errors are not known yet, the pipelines are captured again at a later start", plain, n);
+        else MLOG("pipeline archive: a flush period is not written (%d compiles still inside Metal, %d pipelines); they are captured again at a later start", blocked, n);
         return;
     }
     [NSFileManager.defaultManager createDirectoryAtPath:g_arch_dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -10918,6 +10919,9 @@ static int arch_hand_over(ArchEpoch *only, enum ArchFlush mode) {
     if (!g_arch_cap || (!only && mode != ARCH_FLUSH_NOW && atomic_load(&g_warm_running) && !(warm_due = arch_warm_flush_due()))) return 0;
     int windowed_timer = mode == ARCH_FLUSH_TIMER && mtl_has_window();
     if (windowed_timer && arch_recent_present()) return 1;
+    // A background prebuild's flush (ARCH_FLUSH_NORMAL, no single full period) used to serialize while frames were on screen. The frame's own compile then waited out the
+    // write, and on iOS the picture stopped after the write's log line (Ocarina of Time over HDMI, frame 29679). A full period still rolls over: Metal's store is fixed size.
+    if (mode == ARCH_FLUSH_NORMAL && !only && mtl_has_window() && arch_recent_present()) { arch_note_new(); return 0; }
     os_unfair_lock_lock(&g_ep_lock);
     int active = atomic_load(&g_ep->active);
     int any = (!only || g_ep == only) && (atomic_load(&g_ep->n) || active || atomic_load(&g_ep->crashed));
@@ -19365,7 +19369,14 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     int alloc_i = (int)(ticket % 3);
     if (g_present_alloc_fence[alloc_i]) {
         pthread_mutex_lock(&g_pq_mu);
-        while (g_present_alloc_done[alloc_i] < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 3;
+        while (g_present_alloc_done[alloc_i] < g_present_alloc_fence[alloc_i]) {
+            if (pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &ts) != ETIMEDOUT) continue;
+            MLOG("[RED] present: the display command buffer for ticket %llu has not completed in 3 s (completed through %llu, %d in flight). The allocator is reused so the picture is not stuck waiting for it",
+                 (unsigned long long)g_present_alloc_fence[alloc_i], (unsigned long long)g_present_alloc_done[alloc_i], g_pq_inflight);
+            g_present_alloc_done[alloc_i] = g_present_alloc_fence[alloc_i];
+            break;
+        }
         pthread_mutex_unlock(&g_pq_mu);
     }
     if (atomic_load(&g_present_suspended)) return 0;
@@ -20169,6 +20180,19 @@ void mtl_wait_state_dump(void) {
          (unsigned long long)g_fence, (unsigned long long)g_done, (unsigned long long)g_alloc_fence[0], (unsigned long long)g_alloc_fence[1], (unsigned long long)g_alloc_fence[2],
          atomic_load(&g_up_pending), atomic_load(&g_up_alloc_busy[0]), atomic_load(&g_up_alloc_busy[1]), atomic_load(&g_up_alloc_busy[2]), g_up_seq, g_up_cb != nil,
          (unsigned long long)g_pq_in, (unsigned long long)g_pq_done, g_cb != nil, atomic_load(&g_sub_thread_set));
+}
+// No frame for a few seconds (hle_thread.c hitch dump). Once: the archive gate, the fences the GPU has not completed, and the shaders of the oldest one.
+void mtl_freeze_dump(void) {
+    mtl_wait_state_dump();
+    int compiles = 0, plain = 0, want = 0;
+    pthread_mutex_lock(&g_ser_mu); compiles = g_ser_compiles; plain = g_ser_plain; want = g_ser_want; pthread_mutex_unlock(&g_ser_mu);
+    int active = g_ep ? (int)atomic_load(&g_ep->active) : -1;
+    uint64_t done = atomic_load(&g_done);
+    MLOG("archive/compile: writers %d, compiles inside Metal %d (%d plain), compiles held back %llu (%.0f ms), captures not written %d, period still compiling %d, last command buffer error %d, fences submitted %llu completed %llu, segments in flight %d, presents in flight %d",
+         want, compiles, plain, (unsigned long long)atomic_load(&g_ser_holds), (double)atomic_load(&g_ser_held_ns) / 1e6,
+         (int)atomic_load(&g_arch_new), active, atomic_load(&g_last_commit_error),
+         (unsigned long long)g_fence, (unsigned long long)done, atomic_load(&g_seg_inflight), g_pq_inflight);
+    if (g_fence > done) cbs_fly_report(done + 1);
 }
 uint64_t mtl_alloc_shares(void) { return g_alloc_shares; }   // main submissions that began in the allocator of the one before them
 void mtl_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_alloc_waits; *grown = g_alloc_grown; *n = g_alloc_n; }   // Main submit allocator pool: how many times it waited, how many times it grew, how many exist now
