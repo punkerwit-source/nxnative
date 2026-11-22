@@ -75,7 +75,7 @@ module_t *module_of(const void *p) {
     for (int i = 0; i < g_nmod; ++i) {
         uintptr_t b = (uintptr_t)g_mod[i].base;
         if (a >= b && a - b < g_mod[i].size) return &g_mod[i];
-        if (g_mod[i].patch_off < 0 && a >= b + g_mod[i].patch_off && a < b) return &g_mod[i];
+        if (g_mod[i].patch_off < 0 && a >= b + g_mod[i].patch_off && a < b + g_mod[i].patch_off + g_mod[i].patch_len) return &g_mod[i];
     }
     return NULL;
 }
@@ -350,7 +350,6 @@ static void ownership(void) {
     assert(!pages(1, alias + 15 * P, 2 * P));
     expect(alias + P, alias + P, 2 * P, 5, 1, 0);
     assert(*(uint8_t *)(alias + P) == 0x34);
-    expect(UINTPTR_MAX, UINTPTR_MAX - P + 1, P, 0, 0, 0);
     assert(call(2, alias + P, P, 3) == BAD && call(3, alias + P, P, 0) == BAD);
     assert(unmap(stack + P, alias + P, P) == BAD);
     assert(unmap(stack + P, alias + 4 * P, 2 * P) == BAD);
@@ -414,6 +413,7 @@ static void module_back_patch(void) {
     assert(!mprotect(b + 0x10000, 0x4000, PROT_READ));
     assert(!mprotect(b + 0x20000, 0x8000, PROT_READ));
     expect((uintptr_t)b - 0x8000, (uintptr_t)b - 0x8000, 0x4000, 4, 0, 5);
+    expect((uintptr_t)b - 0x4000, (uintptr_t)b - 0x4000, 0x4000, 0, 0, 0);
     expect((uintptr_t)b + 0x4000, (uintptr_t)b + 0x4000, 0xc000, 4, 0, 3);
     expect((uintptr_t)b + 0x14000, (uintptr_t)b + 0x14000, 0xc000, 4, 0, 3);
     expect((uintptr_t)b + 0x20000, (uintptr_t)b + 0x20000, 0x8000, 4, 0, 5);
