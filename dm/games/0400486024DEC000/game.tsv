@@ -13,7 +13,7 @@ app_category	public.app-category.adventure-games
 pad_layout	full
 
 # ---- Versions ----
-build	v131072	v131072	main=e0f3ccfaf50065ae4ea01eb5aeb13b1a	subsdk0=b0110087a7b339ef74588d3bd0b4dd5d	sdk=1643a838814f9c10c696f930ed681e7f
+build	v131072	1.1.1	main=e0f3ccfaf50065ae4ea01eb5aeb13b1a	subsdk0=b0110087a7b339ef74588d3bd0b4dd5d	sdk=1643a838814f9c10c696f930ed681e7f
 package	v131072
 shader_versions	v131072
 
@@ -24,9 +24,12 @@ zip_store	.zs:.bwav:.webm:.metallib
 
 # ---- Memory ----
 # The Switch 2 leaves games 9 GB of its 12 GB (Donkey Kong Bananza's figure). The NPDM declares 48 MB of system resource, so virtual address memory is on.
-# nninitStartup asks SetHeapSize 0x18ce00000 (6.2 GB) with the 9 GB pool, as Mario Kart World. 256 MB in front + 4 GB alias region + 256 MB stack region + 8 GB heap region: a starting split, to be measured
-mem_reserve	0x320000000
-mem_alias	0x100000000
+# 256 MiB in front + 8 GiB heap + 256 MiB stacks + 5 GiB alias region. 4 GiB and 4.375 GiB both fail the Master Sword
+# bank: at 4.375 GiB the address space was full at +4.37 GB with 2.61 GB mapped (#3103). 5 GiB places the bank.
+# On an iPhone 17 Pro, host 073e3700 with DM_ALIAS_SIZE=0x140000000
+# (this 5 GiB layout, guest AS +0x360000000) GPU allocated still reached about 7.1 GB and the app was killed. The Mac reserves 64 GB (hle_svc.c).
+mem_reserve	0x360000000
+mem_alias	0x140000000
 mem_map_limit	on
 mem_stack	0x10000000
 app_pool	0x240000000

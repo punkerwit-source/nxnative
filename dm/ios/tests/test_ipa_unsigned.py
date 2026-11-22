@@ -17,7 +17,8 @@ import romfs_image
 
 GAME = '010015100B514000'
 SCRIPT = (REPO / 'dm/ios/tools/build_ipa.sh').read_text()
-SIGNING = SCRIPT[SCRIPT.index('# The entitlements of an unsigned IPA'):SCRIPT.index('\nP=Payload/DmIOS.app\n')]
+ENTITLEMENTS = SCRIPT[SCRIPT.index('write_entitlements()'):SCRIPT.index('[ -n "${GAME:-}" ]')]
+SIGNING = ENTITLEMENTS + SCRIPT[SCRIPT.index('# The entitlements of an unsigned IPA'):SCRIPT.index('\nP=Payload/DmIOS.app\n')]
 PACKING = SCRIPT[SCRIPT.index('\nP=Payload/DmIOS.app\n'):]
 PREAMBLE = 'set -u\nt() { :; }; die() { echo "$*" >&2; exit 1; }\ngp() { python3 "$PROFILE_TOOL" "$GAME" "$1"; }\n'
 CAN_SIGN = sys.platform == 'darwin' and shutil.which('codesign') and shutil.which('cc')
@@ -84,8 +85,8 @@ class UnsignedIpaTests(unittest.TestCase):
 
     @unittest.skipUnless(CAN_SIGN, 'needs macOS codesign and a C compiler')
     def test_executable_carries_the_entitlements(self):
-        cases = [({}, True), ({'DM_ENTITLEMENTS': ''}, False)]
-        for extra, expected in cases:
+        cases = [({}, True, False), ({'DM_ENTITLEMENTS': ''}, False, False), ({'DM_IOS_MEMORY_ENTITLEMENTS': '1'}, True, True)]
+        for extra, memory, extended in cases:
             with self.subTest(extra=extra), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 (root / 'DmIOS.app').mkdir(); (root / 'pkg').mkdir()
@@ -94,7 +95,9 @@ class UnsignedIpaTests(unittest.TestCase):
                 result = run_step(SIGNING, root, APP=str(root / 'DmIOS.app'), O=str(root / 'pkg'), **extra)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 shown = subprocess.run(['codesign', '-d', '--entitlements', '-', str(root / 'DmIOS.app/DmIOS')], capture_output=True, text=True)
-                self.assertEqual('com.apple.developer.kernel.increased-memory-limit' in shown.stdout + shown.stderr, expected)
+                text = shown.stdout + shown.stderr
+                self.assertEqual('com.apple.developer.kernel.increased-memory-limit' in text, memory)
+                self.assertEqual('com.apple.developer.kernel.extended-virtual-addressing' in text, extended)
 
 
 if __name__ == '__main__':

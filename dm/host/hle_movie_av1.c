@@ -3,26 +3,30 @@
 // aborts on a decoder that does not initialize (movie::detail::InitializeDecoderByTransferMemory, subsdk2+0xf9b4), so without one a game with AV1 movies could not run there.
 // VideoToolbox wants a format description holding the stream's av1C record (ISO-BMFF AV1 binding, 2.3.3): four bytes read from the sequence header, then that header's OBU. The decoder API takes no
 // configuration for AV1, so the sequence header comes from the stream, where every key frame carries one (AV1 5.5); a changed one makes a new session. A temporal unit goes in whole, its OBUs in
-// the low-overhead format WebM and the SDK's demuxer keep them in (each with its size). Decoding is synchronous and a temporal unit shows at most one frame, in presentation order, so no queue.
+// the low-overhead format WebM and the SDK's demuxer keep them in (each with its size). A temporal unit shows at most one frame, in presentation order, so no queue. iOS's hardware decoder may deliver that frame after DecodeFrame returns; the submit waits for it.
 // dav1d decodes several frames at once (frame threads), so its pictures come out later than their units go in, each with its unit's time (mav1_next)
 #include "hle.h"
 #include <VideoToolbox/VideoToolbox.h>
 #include "dav1d/dav1d.h"
 #include "hle_movie_av1.h"
+#include "hle_movie_vt.h"
 
 struct mav1 {
     uint8_t seq[512]; size_t nseq;
     CMVideoFormatDescriptionRef fd; VTDecompressionSessionRef vs;
     CVPixelBufferRef got, locked;
+    uint8_t *plane; size_t nplane;   // the VideoToolbox picture copied out so its buffer can return to the decoder's pool before the next packet
     int soft;                     // dav1d decodes: no hardware decoder, DM_AV1_DAV1D=1, or a stream VideoToolbox refused (until mav1_reset)
+    int empty_n;                  // temporal units that produced no picture after the session existed
     Dav1dContext *dav1d; Dav1dPicture pic; int has_pic;
     Dav1dData in;                 // the temporal unit dav1d has not taken whole yet
     int draining;                 // a drain gave a picture and has not reached its end (dav1d_step)
     uint8_t *y8, *uv; size_t ny8, nuv;   // dav1d's picture as NV12: the chroma interleaved, and the luma of a 10- or 12-bit stream shifted to 8 bits
     int red;
+    movie_vt_history history;
 };
 static int hw_av1(void) { const char *e = getenv("DM_AV1_DAV1D"); return !(e && *e && *e != '0') && VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1); }
-mav1 *mav1_new(void) { mav1 *a = calloc(1, sizeof *a); if (!a) die("movie: AV1 decoder allocation failed"); a->soft = !hw_av1(); return a; }
+mav1 *mav1_new(movie_vt_control *control) { mav1 *a = calloc(1, sizeof *a); if (!a) die("movie: AV1 decoder allocation failed"); a->soft = !hw_av1(); a->history.control = control; return a; }
 const char *mav1_backend(const mav1 *a) { return a->soft ? "dav1d" : "VideoToolbox"; }
 static void unlock_picture(mav1 *a) {
     if (a->locked) { CVPixelBufferUnlockBaseAddress(a->locked, kCVPixelBufferLock_ReadOnly); CVPixelBufferRelease(a->locked); a->locked = NULL; }
@@ -33,8 +37,8 @@ static void av1_close(mav1 *a) {
     if (a->fd) { CFRelease(a->fd); a->fd = NULL; }
     if (a->got) { CVPixelBufferRelease(a->got); a->got = NULL; }
 }
-void mav1_reset(mav1 *a) { unlock_picture(a); av1_close(a); a->nseq = 0; if (a->in.sz) dav1d_data_unref(&a->in); if (a->dav1d) dav1d_flush(a->dav1d); a->draining = 0; a->soft = !hw_av1(); }
-void mav1_free(mav1 *a) { if (a) { mav1_reset(a); if (a->dav1d) dav1d_close(&a->dav1d); free(a->y8); free(a->uv); free(a); } }
+void mav1_reset(mav1 *a) { unlock_picture(a); av1_close(a); movie_vt_clear(&a->history); a->nseq = 0; a->empty_n = 0; if (a->in.sz) dav1d_data_unref(&a->in); if (a->dav1d) dav1d_flush(a->dav1d); a->draining = 0; a->soft = !hw_av1(); }
+void mav1_free(mav1 *a) { if (a) { mav1_reset(a); if (a->dav1d) dav1d_close(&a->dav1d); free(a->y8); free(a->uv); free(a->plane); free(a); } }
 
 // ---- The sequence header (AV1 5.5), read as far as the colour config ----
 typedef struct { const uint8_t *p; size_t n, bit; int bad; } av1_bits;
@@ -115,9 +119,31 @@ static const uint8_t *find_seq(const uint8_t *p, size_t n, size_t *len) {
     }
     return NULL;
 }
+// Only a shown key frame resets every reference slot (AV1 5.9.2).
+// Hidden key frames can retain references to pictures before them.
+static int av1_key(const mav1 *a, const uint8_t *data, size_t n) {
+    int key = 0;
+    for (size_t i = 0; i < n;) {
+        size_t hdr = data[i] & 4 ? 2 : 1; uint64_t size;
+        size_t l = i + hdr < n ? leb128(data + i + hdr, n - i - hdr, &size) : 0;
+        if (!(data[i] & 2) || !l || size > n - i - hdr - l) break;
+        unsigned type = data[i] >> 3 & 15;
+        if ((type == 3 || type == 6) && size && a->nseq) {
+            size_t sh = a->seq[0] & 4 ? 2 : 1; uint64_t sn;
+            size_t sl = leb128(a->seq + sh, a->nseq - sh, &sn);
+            uint8_t frame = data[i + hdr + l];
+            key = sl && sn && ((a->seq[sh + sl] & 8) || (frame & 0xf0) == 0x10);
+            break;
+        }
+        i += hdr + l + (size_t)size;
+    }
+    return key;
+}
 static void av1_on_frame(void *ref, void *src, OSStatus st, VTDecodeInfoFlags fl, CVImageBufferRef img, CMTime pts, CMTime dur) {
     (void)src; (void)fl; (void)pts; (void)dur; mav1 *a = ref;
-    if (st || !img) { if (st && !a->red++) LOG("[RED] movie: AV1 decode error (VideoToolbox %d, first case)", (int)st); return; }
+    __atomic_store_n(&a->history.callback_ran, 1, __ATOMIC_RELEASE);
+    if (st) { a->history.status = st; return; }
+    if (a->history.replaying || !img) return;
     if (a->got) CVPixelBufferRelease(a->got);
     a->got = CVPixelBufferRetain(img);
 }
@@ -133,14 +159,20 @@ static int av1_open(mav1 *a, const uint8_t *seq, size_t n) {
     CFDictionaryRef ext = CFDictionaryCreate(NULL, ek, ev, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks); CFRelease(atoms);
     OSStatus st = CMVideoFormatDescriptionCreate(NULL, kCMVideoCodecType_AV1, w, h, ext, &a->fd); CFRelease(ext);
     if (st) { if (!a->red++) LOG("[RED] movie: no format description for AV1 (%d)", (int)st); return 0; }
-    int32_t pf = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    CFNumberRef num = CFNumberCreate(NULL, kCFNumberSInt32Type, &pf);
-    const void *k[] = {kCVPixelBufferPixelFormatTypeKey}, *v[] = {num};
-    CFDictionaryRef attrs = CFDictionaryCreate(NULL, k, v, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks); CFRelease(num);
+    int32_t pf = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, minb = 4;
+    CFNumberRef num = CFNumberCreate(NULL, kCFNumberSInt32Type, &pf), minn = CFNumberCreate(NULL, kCFNumberSInt32Type, &minb);
+    CFDictionaryRef io = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    // IOSurface-backed buffers are what the iOS hardware decoder draws into. Without them it can finish DecodeFrame with no picture once its small pool is exhausted, and the
+    // reader's one output buffer then waits for a sync that never comes. Four buffers cover one held by the caller and the decoder's own delay.
+    const void *k[] = {kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey, kCVPixelBufferPoolMinimumBufferCountKey};
+    const void *v[] = {num, io, kCFBooleanTrue, minn};
+    CFDictionaryRef attrs = CFDictionaryCreate(NULL, k, v, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFRelease(num); CFRelease(minn); CFRelease(io);
     VTDecompressionOutputCallbackRecord cb = {av1_on_frame, a};
-    st = VTDecompressionSessionCreate(NULL, a->fd, NULL, attrs, &cb, &a->vs); CFRelease(attrs);
+    st = movie_vt_create(&a->history, a->fd, attrs, &cb, &a->vs); CFRelease(attrs);
+    if (st == MOVIE_VT_CANCELLED) return -1;
     if (st) { if (!a->red++) LOG("[RED] movie: VideoToolbox cannot create an AV1 session (%d)", (int)st); a->vs = NULL; return 0; }
-    memcpy(a->seq, seq, n); a->nseq = n;
+    if (a->seq != seq) memcpy(a->seq, seq, n); a->nseq = n;
     static int once; if (!once++) LOG("[movie] AV1: VideoToolbox decoding %dx%d, profile %d level %d", w, h, rec[1] >> 5, rec[1] & 31);
     return 1;
 }
@@ -243,26 +275,60 @@ int mav1_decode(mav1 *a, const uint8_t *data, size_t n, int64_t ts, mav1_picture
     if (a->soft) return decode_dav1d(a, data, n, ts, out);
     unlock_picture(a);
     size_t seqn = 0; const uint8_t *seq = find_seq(data, n, &seqn);
-    if (seq && (seqn != a->nseq || memcmp(seq, a->seq, seqn) || !a->vs) && !av1_open(a, seq, seqn)) {   // a stream VideoToolbox does not take: dav1d from this temporal unit on (it holds the sequence header)
-        LOG("[movie] AV1: dav1d decodes the stream instead"); av1_close(a); a->soft = 1;
-        return decode_dav1d(a, data, n, ts, out);
+    int changed = seq && (seqn != a->nseq || memcmp(seq, a->seq, seqn));
+    if (changed) movie_vt_clear(&a->history);
+    if (seq && (changed || !a->vs)) {
+        int opened = av1_open(a, seq, seqn);
+        if (opened < 0) return 0;   // Stop / Flush / Finalize cancelled a lifecycle wait
+        if (!opened) {   // a stream VideoToolbox does not take: dav1d from this temporal unit on (it holds the sequence header)
+            LOG("[movie] AV1: dav1d decodes the stream instead"); av1_close(a); a->soft = 1;
+            return decode_dav1d(a, data, n, ts, out);
+        }
     }
     if (!a->vs) return 0;   // the stream's first sequence header has not come
     CMBlockBufferRef bb = NULL; CMSampleBufferRef sb = NULL; size_t ssz = n;
     OSStatus st = CMBlockBufferCreateWithMemoryBlock(NULL, NULL, n, NULL, NULL, 0, n, 0, &bb);
     if (!st) st = CMBlockBufferReplaceDataBytes(data, bb, 0, n);
     if (!st) st = CMSampleBufferCreateReady(NULL, bb, a->fd, 1, 0, NULL, 1, &ssz, &sb);
-    if (!st) st = VTDecompressionSessionDecodeFrame(a->vs, sb, 0, NULL, NULL);   // flags 0: synchronous, the callback has run when this returns
+    if (!st) {
+        int key = av1_key(a, data, n);
+        if (key) { movie_vt_clear(&a->history); a->history.key = 1; }
+        st = movie_vt_submit(&a->history, a->vs, sb, NULL);
+        while (st == kVTInvalidSessionErr && a->history.key) {
+            int opened = av1_open(a, a->seq, a->nseq);
+            if (opened < 0) st = MOVIE_VT_CANCELLED;
+            else if (opened) {
+                st = movie_vt_replay(&a->history, a->vs);
+                if (!st) st = movie_vt_submit(&a->history, a->vs, sb, NULL);
+            } else break;
+        }
+        if (!st) movie_vt_remember(&a->history, sb);
+    }
     if (sb) CFRelease(sb);
     if (bb) CFRelease(bb);
+    if (st == MOVIE_VT_CANCELLED) return 0;
     if (st) { if (!a->red++) LOG("[RED] movie: AV1 decode submission failed (%d, first case)", (int)st); return -1; }
-    if (!a->got) return 0;
-    CVPixelBufferRef pb = a->got; a->got = NULL; a->locked = pb;
+    if (!a->got) {
+        if (a->vs && a->empty_n++ < 4) LOG("[movie] AV1: a temporal unit produced no picture (%d so far)", a->empty_n);
+        return 0;
+    }
+    CVPixelBufferRef pb = a->got; a->got = NULL;
     CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    int w = (int)CVPixelBufferGetWidthOfPlane(pb, 0), h = (int)CVPixelBufferGetHeightOfPlane(pb, 0);
+    size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), uvs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+    const uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    size_t need = (size_t)w * h + (size_t)w * ((h + 1) / 2);
+    int copied = y && uv && w > 0 && h > 0 && grow(&a->plane, &a->nplane, need);
+    if (copied) {
+        for (int r = 0; r < h; r++) memcpy(a->plane + (size_t)r * w, y + (size_t)r * ys, (size_t)w);
+        for (int r = 0; r < (h + 1) / 2; r++) memcpy(a->plane + (size_t)w * h + (size_t)r * w, uv + (size_t)r * uvs, (size_t)w);
+    }
     CFStringRef m = CVBufferCopyAttachment(pb, kCVImageBufferYCbCrMatrixKey, NULL);
-    *out = (mav1_picture){CVPixelBufferGetBaseAddressOfPlane(pb, 0), CVPixelBufferGetBaseAddressOfPlane(pb, 1), CVPixelBufferGetBytesPerRowOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 1),
-                          (int)CVPixelBufferGetWidthOfPlane(pb, 0), (int)CVPixelBufferGetHeightOfPlane(pb, 0),
-                          !m || CFEqual(m, kCVImageBufferYCbCrMatrix_ITU_R_709_2) ? 2 : CFEqual(m, kCVImageBufferYCbCrMatrix_ITU_R_2020) ? 5 : 1, 0, ts};
+    int matrix = !m || CFEqual(m, kCVImageBufferYCbCrMatrix_ITU_R_709_2) ? 2 : CFEqual(m, kCVImageBufferYCbCrMatrix_ITU_R_2020) ? 5 : 1;
     if (m) CFRelease(m);
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferRelease(pb);   // back to the decoder's pool before the reader waits to release its own buffer
+    if (!copied) { if (!a->red++) LOG("[RED] movie: no memory for a %dx%d AV1 picture", w, h); return -1; }
+    *out = (mav1_picture){a->plane, a->plane + (size_t)w * h, (size_t)w, (size_t)w, w, h, matrix, 0, ts};
     return 1;
 }

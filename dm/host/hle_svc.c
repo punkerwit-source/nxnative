@@ -6,6 +6,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <unistd.h>
@@ -13,6 +14,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include <mach/mach.h>
+#include <mach/vm_param.h>
 #include <TargetConditionals.h>
 #include <CoreFoundation/CoreFoundation.h>   // the volume's free space with what the system can purge (guest_file_free_important)
 #if TARGET_OS_IPHONE
@@ -64,7 +66,7 @@ static size_t env_size(const char *name, size_t min, size_t align) {
 // ends an app at, which otherwise charges every page the game has touched; they take the same memory while they stay in it, and the kernel can write them to the files when it needs the room, which it
 // cannot do with an iPhone app's anonymous pages. A page never written reads 0, and mprotect (dirty tracking), vm_remap (virtual pools) and Metal's no-copy buffers work on them as on anonymous pages.
 // The cost is disk: the files take up to what the game has touched, and the kernel writes them back as it does any file (Mario Kart World on a 16 GB Mac: 5.6 GB on disk and 8-10 GB of logical writes
-// in 5.5 minutes). So a game that fits stays anonymous: on iOS the files are on when the game's memory pool is larger than the room to the memory limit at start (guest_file_wanted), and on the Mac,
+// in 5.5 minutes). So a game that fits stays anonymous: on iOS the files are on when the game's memory pool and the host's margin are larger than the room to the memory limit at start (guest_file_wanted), and on the Mac,
 // which can swap, only when asked. DM_GUEST_FILE=1 forces them on and 0 off.
 // DM_GUEST_FILE_CHUNK=<size> sets each file's size (default 1G, at least 64M, raised to make at most GF_MAX files; one file when it is not under the block's size). The stall at the system's periodic
 // flush, about every 30 s, grows with the file: threads touching the memory stalled 130-432 ms on an iPhone with one 20 GB file, and on a 16 GB M5 Mac with 1 GB touched up to 148 ms with one 20 GB
@@ -77,7 +79,7 @@ static size_t env_size(const char *name, size_t min, size_t align) {
 int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);   // libproc.h, which the iOS SDK does not have
 #define GF_MAX 1024
 static int g_gf_tab[GF_MAX];       // the files, open for reading and writing
-static int g_gf_n;                 // how many; 0 while the guest is anonymous. Set by mem_init_once, whose pthread_once orders it before every reader
+static int g_gf_n;                 // how many, or 0 for anonymous memory. Set before mem_init returns and before guest_file_thread starts
 static size_t g_gf_chunk;          // each file's size; the last one holds the rest of the block
 static uint64_t g_gf_min_free;     // DM_GUEST_FILE_MIN_FREE in bytes: the free space on the files' disk, less what the dirty pages may still take, under which the game is stopped; 0 = never
 static int g_gf_punch = 1;         // DM_GUEST_FILE_PUNCH=0: what the game gives back keeps its disk blocks (only PROT_NONE), as before
@@ -136,6 +138,103 @@ static void guest_file_scan(const char *vec, size_t pg) {
 }
 
 static void guest_file_sweep(void);
+static _Atomic uint64_t g_gf_dirty_bytes;   // the last mincore count (guest_file_thread), for the pressure line
+static _Atomic int g_mem_hot;               // iOS memorypressure warned, until headroom recovers
+__attribute__((weak)) void mtl_mem_breakdown(char *out, size_t n) { if (out && n) out[0] = 0; }
+static int ios_headroom_mb(void) {
+    static int v = -2;
+    if (v == -2) { const char *e = getenv("DM_NVN_IOS_HEADROOM_MB"); v = e && *e ? atoi(e) : 1536; }
+    return v;
+}
+// Ask the kernel to write dirty guest-file pages back. Once clean they leave phys_footprint: the compressed set is where a dirty file page waits, and on a long
+// Ocarina session that set sat near 3.7 GB while mincore still saw about 2 GB dirty. The heap is the part the game keeps mapped; walking only the alias left it compressed.
+// MS_ASYNC schedules the write. sync_n forces that many leading chunks through (MS_SYNC). A no-copy Metal buffer over a pool
+// keeps its own wiring. Chunks of 64 MB, heap first, then the alias high water. A chunk with a hole (PROT_NONE) can fail; the next chunk still runs.
+static void msync_span(uint8_t *p, size_t n, int flags) {
+    if (!p || n < 4096) return;
+    if (msync(p, n, flags)) { static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 3) LOG("[RED] [mem] guest file writeback %zu MB failed (errno %d)", n >> 20, errno); }
+}
+static void guest_file_writeback(int chunks, int sync_n) {
+    if (!g_gf_n || chunks <= 0) return;
+    uint8_t *alias = g_alias;   // local, so a null alias is not added to: the high water is then zero and the else branch does not run
+    size_t heap_n = g_heap ? atomic_load(&g_heap_cur) : 0, alias_n = alias ? (size_t)atomic_load(&g_alias_hw) : 0, span = heap_n + alias_n;
+    if (span < 65536) return;
+    static _Atomic uint64_t cursor;
+    size_t step = 64u << 20;
+    for (int i = 0; i < chunks; i++) {
+        size_t off = (size_t)(atomic_fetch_add(&cursor, step) % span);
+        int flags = i < sync_n ? MS_SYNC : MS_ASYNC;
+        if (off < heap_n) {
+            size_t n = off + step > heap_n ? heap_n - off : step;
+            msync_span(g_heap + off, n, flags);
+            if (n < step && alias) msync_span(alias, step - n < alias_n ? step - n : alias_n, MS_ASYNC);
+        } else if (alias) {
+            size_t a = off - heap_n, n = a + step > alias_n ? alias_n - a : step;
+            msync_span(alias + a, n, flags);
+        }
+    }
+}
+static void mem_room_log_at(const char *why, int force) {
+    static uint64_t last;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    if (!force && last && now - last < 2000000000ull) return;
+    if (force && last && now - last < 1000000000ull) return;
+    last = now;
+    task_vm_info_data_t vi; mach_msg_type_number_t nc = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &nc) != KERN_SUCCESS) memset(&vi, 0, sizeof vi);
+    char gfx[480]; mtl_mem_breakdown(gfx, sizeof gfx);
+    const double G = 1073741824.0;
+#if TARGET_OS_IPHONE
+    size_t avail = os_proc_available_memory();
+#else
+    size_t avail = 0;
+#endif
+    LOG("[mem] %s: headroom %llu MB, footprint %.2f GB (internal %.2f, compressed %.2f), guest file dirty %.2f GB%s%s",
+        why, (unsigned long long)(avail >> 20), vi.phys_footprint / G, vi.internal / G, vi.compressed / G, (double)atomic_load(&g_gf_dirty_bytes) / G,
+        gfx[0] ? "; " : "", gfx);
+}
+static void mem_room_log(const char *why) { mem_room_log_at(why, 0); }
+#if TARGET_OS_IPHONE
+void mem_headroom_watch(void) {   // a submission while the last sample was already under the floor (nvn_mtl.m): the 1 s pass can miss the drop
+    size_t avail = os_proc_available_memory();
+    if (avail >= (400u << 20)) return;
+    mem_room_log_at("headroom under 400 MB", 1);
+}
+// Headroom under 300 MB (nvn_mtl.m, before a residency commit). MS_SYNC the opened heap, which is the stable dirty set, and up to 1 GB of the alias.
+// MS_ASYNC of 512 MB/s does not drain a 3.8 GB compressor that is already ahead of mincore: the 1938 log shows compressed at 3.3 GB while dirty reads 0.
+void mem_emergency_sync(void) {
+    if (!g_gf_n) return;
+    size_t heap_n = g_heap ? atomic_load(&g_heap_cur) : 0, step = 64u << 20;
+#ifdef MADV_PAGEOUT
+    if (g_heap && heap_n >= 4096) madvise(g_heap, heap_n, MADV_PAGEOUT);
+#endif
+    for (size_t off = 0; off < heap_n; off += step) msync_span(g_heap + off, off + step > heap_n ? heap_n - off : step, MS_SYNC);
+    uint8_t *alias = g_alias;
+    size_t alias_n = alias ? (size_t)atomic_load(&g_alias_hw) : 0, lim = alias_n < (1ull << 30) ? alias_n : (1ull << 30);
+    static _Atomic uint64_t cursor;
+    for (size_t done = 0; done < lim && alias; done += step) {
+        size_t off = (size_t)(atomic_fetch_add(&cursor, step) % alias_n);
+        size_t n = off + step > alias_n ? alias_n - off : step;
+        msync_span(alias + off, n, MS_SYNC);
+    }
+    mem_room_log_at("emergency sync", 1);
+}
+static void mem_pressure_start(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+            DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        if (!src) return;
+        dispatch_source_set_event_handler(src, ^{
+            atomic_store(&g_mem_hot, 1);
+            if (g_gf_n) { guest_file_sweep(); guest_file_writeback(8, 1); }
+            mem_room_log("memorypressure");
+        });
+        dispatch_resume(src);
+    });
+}
+#endif
 // The free space on the files' disk with what the system can purge on demand (caches, offloadable data): NSURLVolumeAvailableCapacityForImportantUsageKey, through CFURL, the figure an app is
 // meant to check before writing what the user asked for, and close to what Settings shows as available; f_bavail leaves that space out (on the iPad that stopped at 5.0 GB f_bavail).
 // The query asks the system's cache-delete service: 4-65 ms on the Mac, where it gave 14.73 GB for 14.71 of f_bavail (little is purgeable there). -1 when it fails
@@ -169,8 +268,26 @@ static void *guest_file_thread(void *arg) {
         if (sec % 10 == 1) {   // every 10 s, from the first second (a burst of new dirty pages between two counts is what the margin's other half is for)
             clock_gettime(CLOCK_MONOTONIC, &t0);
             dirty = vec ? guest_file_dirty(vec, pg) : -1;
+            if (dirty >= 0) atomic_store(&g_gf_dirty_bytes, (uint64_t)dirty);
             clock_gettime(CLOCK_MONOTONIC, &t1); count_ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
         }
+#if TARGET_OS_IPHONE
+        { size_t avail = os_proc_available_memory(); int room = ios_headroom_mb();
+          int low = room > 0 && avail < (size_t)room << 20;
+          int tight = avail < (1200u << 20);
+          uint64_t dirty_b = atomic_load(&g_gf_dirty_bytes);
+          if (avail < (400u << 20)) mem_room_log_at("headroom under 400 MB", 1);
+          // Dirty file pages are the compressor. Write them back before headroom is already low, heap and alias, and force one chunk through when the margin is thin.
+          if (low || atomic_load(&g_mem_hot) || dirty_b > (512ull << 20)) {
+              if (low || atomic_load(&g_mem_hot)) guest_file_sweep();
+              int chunks = tight || dirty_b > (1ull << 30) ? 8 : 4;
+              int sync_n = tight || atomic_load(&g_mem_hot) ? 4 : dirty_b > (1ull << 30) ? 2 : 0;
+              if (sync_n > chunks) sync_n = chunks;
+              guest_file_writeback(chunks, sync_n);
+              if (low && (tight ? sec % 2 == 0 : sec % 10 == 0)) mem_room_log("pressure");
+          }
+          if (!low && avail > ((size_t)room << 20) + (256u << 20)) atomic_store(&g_mem_hot, 0); }
+#endif
         double need = dirty > 0 ? dirty : 0, held = 0;
         int fs_ok = !fstatfs(g_gf_tab[0], &fs); double avail = fs_ok ? (double)fs.f_bavail * fs.f_bsize : -1, room = avail - need;
         if (fs_ok && g_gf_min_free && room < (double)g_gf_min_free) {
@@ -197,8 +314,23 @@ static void *guest_file_thread(void *arg) {
     }
     return NULL;
 }
-// Whether the guest goes in files: DM_GUEST_FILE when it is set, otherwise when the game's memory pool does not fit the room to the memory limit (room 0: no limit known, as on the Mac)
-static int guest_file_wanted(const char *e, uint64_t pool, uint64_t room) { return e && *e ? atoi(e) > 0 : room && pool > room; }
+// The host's own memory to come, which the room at start (os_proc_available_memory, read before the game runs) has to hold beside the guest's pages: mostly graphics memory, Metal's
+// copies of the game's textures (Metal cannot sample the guest's block-linear storage), render targets and upload staging, then malloc. It follows what the game keeps in its pool, from
+// a tenth of the pool to all of it, while the guest touches only part of its pool; what has to fit is the two together. Their peak against the pool, measured with the guest in files (which
+// leaves its pages out of phys_footprint; the host's own memory is the footprint less DM_MEMSTAT's guest class, the guest's its resident pages) on a 16 GB M6 Mac, 2026-11-15, about 5 minutes
+// of play each: The Binding of Isaac 0.67 GB of a 3.21 GB pool (0.21: host 0.41), Mario Golf: Super Rush 3.93 GB (1.23: host 3.22, as much as its pool, 21,514 textures; guest 0.72),
+// Fast Fusion at least 6.95 GB of 9 (0.77: host 4.90; guest 2.05), Ocarina of Time host 5.39 GB at an area load and 4.3-4.8 walking, with 6.4 GB of guest memory on that walk (about 1.24;
+// its game note), and Mario Kart World at least 11.94 GB of 9 (1.33), where iOS ended it on an iPad with 11.97 GB of room after 28 minutes, the guest anonymous because its pool alone fitted
+// (GitHub issue #1184). Half the pool covers them all, and with it a Switch game's 3.21 GB pool stays anonymous with 6 and 8 GB limits while every 9 GB pool goes in files on iOS.
+// DM_GUEST_FILE_HOST=<size> sets the margin instead (0 for none, the rule before it)
+#define GUEST_HOST_PCT 50
+static uint64_t guest_host_margin(uint64_t pool) {
+    const char *h = getenv("DM_GUEST_FILE_HOST");
+    return h && *h ? env_size("DM_GUEST_FILE_HOST", 0, 0x100000) : pool * GUEST_HOST_PCT / 100;
+}
+// Whether the guest goes in files: DM_GUEST_FILE when it is set, otherwise when the game's memory pool and the host's margin (guest_host_margin) do not fit the room to the memory limit
+// (room 0: no limit known, as on the Mac)
+static int guest_file_wanted(const char *e, uint64_t pool, uint64_t host, uint64_t room) { return e && *e ? atoi(e) > 0 : room && pool + host > room; }
 // A new file of this process's own, never a link's target (O_EXCL, O_NOFOLLOW): one a dead process with the same number left is replaced
 static int guest_file_open(const char *path) {
     const int fl = O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC;
@@ -267,11 +399,12 @@ static int guest_files_map(const char *dir, size_t chunk, int n, struct statfs *
 static void guest_file_init(void) {
     const double G = 1073741824.0; const char *e = getenv("DM_GUEST_FILE"), *d = getenv("DM_GUEST_FILE_DIR"), *mf = getenv("DM_GUEST_FILE_MIN_FREE");
 #if TARGET_OS_IPHONE
-    uint64_t room = os_proc_available_memory();
-    int want = guest_file_wanted(e, DM_GAME_APP_POOL, room);
-    LOG("[mem] guest memory: memory pool %.2f GB, room to the memory limit %.2f GB, DM_GUEST_FILE %s: %s", DM_GAME_APP_POOL / G, room / G, e && *e ? e : "unset", want ? "in files" : "anonymous");
+    uint64_t room = os_proc_available_memory(), host = guest_host_margin(DM_GAME_APP_POOL);
+    int want = guest_file_wanted(e, DM_GAME_APP_POOL, host, room);
+    LOG("[mem] guest memory: memory pool %.2f GB and the host's margin %.2f GB (%s), room to the memory limit %.2f GB, DM_GUEST_FILE %s: %s", DM_GAME_APP_POOL / G, host / G,
+        getenv("DM_GUEST_FILE_HOST") && *getenv("DM_GUEST_FILE_HOST") ? "DM_GUEST_FILE_HOST" : "half the pool", room / G, e && *e ? e : "unset", want ? "in files" : "anonymous");
 #else
-    int want = guest_file_wanted(e, DM_GAME_APP_POOL, 0);
+    int want = guest_file_wanted(e, DM_GAME_APP_POOL, guest_host_margin(DM_GAME_APP_POOL), 0);   // no limit known: only the switch
 #endif
     if (!want) return;
     g_gf_min_free = mf && *mf ? env_size("DM_GUEST_FILE_MIN_FREE", 0, 0x100000) : (uint64_t)2 << 30;
@@ -291,9 +424,6 @@ static void guest_file_init(void) {
     if (g_gf_min_free && most < DM_GAME_APP_POOL + g_gf_min_free)
         LOG("[RED] [mem] guest file: the files may take up to the memory pool, %.1f GB, and %.1f GB is free: the game is stopped if under %.1f GB is left", DM_GAME_APP_POOL / G, most / G, g_gf_min_free / G);
     if (strcmp(fs.f_fstypename, "apfs") || !(fs.f_flags & MNT_LOCAL)) LOG("[RED] [mem] guest file: not on a local APFS volume, where it may not be sparse, or be slow");
-    pthread_t th; int rc = pthread_create(&th, NULL, guest_file_thread, NULL);
-    if (!rc) pthread_detach(th);
-    else LOG("[RED] [mem] guest file: no thread to watch it (error %d): no 10-s line, and nothing stops the game when its disk fills", rc);
 }
 
 static void *alias_windows_thread(void *arg);
@@ -316,7 +446,7 @@ static void mem_init_once(void) {
     if (as && *as) { alias = (size_t)strtoull(as, NULL, 0); if (alias < 0x10000000 || (alias & (pg - 1))) die("DM_ALIAS_SIZE %s: at least 256 MB, in whole host pages", as); }
     g_reserve = RESERVE - DM_GAME_MEM_ALIAS + alias;
     g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (g_as == MAP_FAILED) die("reserve guest AS");
+    if (g_as == MAP_FAILED) die("reserve guest AS of %.2f GB failed (errno %d). On iOS the increased-memory-limit entitlement is what leaves a free block this large; without it this phone's largest free block was 6 GB and os_proc_available_memory was 3351 MB", g_reserve / 1073741824.0, errno);
     guest_file_init();
     // Fixed partition (all inside the reserved block): 256 MB in front, the heap, the stacks, then the alias region. Mario: a heap region of 1.625 GB, stack 256 MB, alias 2.875 GB.
     // The alias region is last because a Switch's addresses stay below 2^39 and a 64 GB alias region cannot: macOS 27 reserves 0x1000000000-0x7000000000, which leaves exactly 64 GB below
@@ -333,7 +463,16 @@ static void mem_init_once(void) {
     if (!(g_alias_bits = calloc((g_alias_cap >> 18) + 1, sizeof *g_alias_bits))) die("alias region page bitmap calloc");
     if (!(g_alias_exposed = calloc(g_alias_cap / pg / 64 + 1, sizeof *g_alias_exposed))) die("alias exposure bitmap calloc");
     if (!(g_alias_rel = calloc(g_alias_cap / pg / 64 + 1, sizeof *g_alias_rel)) || !(g_alias_aged = calloc(g_alias_cap / pg / 64 + 1, sizeof *g_alias_aged))) die("alias release bitmap calloc");
+    // The watcher's dirty-page scan reads the guest layout, and its sweep reads the alias bitmaps.
+    if (g_gf_n) {
+        pthread_t th; int rc = pthread_create(&th, NULL, guest_file_thread, NULL);
+        if (!rc) pthread_detach(th);
+        else LOG("[RED] [mem] guest file: no thread to watch it (error %d): no 10-s line, and nothing stops the game when its disk fills", rc);
+    }
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p", g_as, (unsigned long long)g_reserve, g_heap, g_alias, g_stack);
+#if TARGET_OS_IPHONE
+    mem_pressure_start();
+#endif
     if ((uint64_t)(uintptr_t)g_alias > UINT64_C(1) << 39) LOG("[mem] the heap and stacks reach past 2^39, which a Switch's addresses never do: a crash on a cut-off pointer points here (DM_ALIAS_SIZE=<profile's mem_alias> keeps them lower)");
     const char *aw = getenv("DM_ALIAS_WINDOWS");
     if (aw && atoi(aw) > 0) { pthread_t th; if (!pthread_create(&th, NULL, alias_windows_thread, (void *)(uintptr_t)atoi(aw))) pthread_detach(th); }
@@ -350,17 +489,23 @@ static void mem_init(void) {
 // Previously 3 GB was reported here and SetHeapSize never failed: the heap was about 150 MB smaller than on the real device, at the run entry peak the main heap had only about 18 MB left, and under high local load a timing shift made a 128 KB request return null,
 // which the guest writes to without a null check (CRASH main+0x1b36138, re-verified after merge with inv_tap).
 #define APP_POOL DM_GAME_APP_POOL   // game profile app_pool (Mario 0xCD500000)
-static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++) if (!g_mod[i].nro) n += g_mod[i].size;   // an NRO lives in memory the game allocated (its image and bss buffers)
-    return (n + 0x1fffff) & ~(size_t)0x1fffff; }
 // Giant bss (modules with the patch area before the base, patch_nso.py FAR): the image bytes beyond the file part. Used memory was reported as "heap + 64 MB", where the 64 MB covers ordinary modules' code and data (Mario's two modules are about 74 MB together,
 // and the heap it opens = pool − 64 MB − 1.75 GB virtual address memory − 1 MB = 0x5be00000, as on hardware); Metroid Dread's main has about 1.8 GB of bss, the engine's static heap, which the Switch counts as used;
 // without it the game asks for pool − 64 MB = 3.15 GB of heap
-// Like image_bytes, exclude NROs: their buffers already belong to the game's heap. Counting every offline-mapped NRO's bss made FFX/X-2's used memory exceed its pool before any LoadModule.
+// NROs are left out: their buffers already belong to the game's heap. Counting every offline-mapped NRO's bss made FFX/X-2's used memory exceed its pool before any LoadModule.
 static size_t big_bss_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++) if (!g_mod[i].nro && g_mod[i].patch_off < 0) n += g_mod[i].size - g_mod[i].back_len - g_mod[i].file_image_len; return n; }
+static _Atomic int64_t g_alias_mapped;   // bytes mapped in the alias region (page bitmap)
+// The used memory beside the heap, one figure: GetInfo's UsedMemorySize is the heap plus this, and SetHeapSize and MapPhysicalMemory charge this against the pool, as Horizon charges a
+// request against the pool less the used memory it reports. A game that asks for total − used (the SDK's nninitStartup, Age of Calamity, Monster Hunter Rise) therefore always gets it.
+// SetHeapSize charged the rewritten modules' size instead (their patch areas and key pages included), which GetInfo never reported: a game whose modules were larger than mem_used was
+// refused the heap the host had just offered (ResultLimitReached; MIO: Memories in Orbit, 68 MB of modules against the default 64 MB, aborted in nninitStartup, GitHub issue #941).
+// mem_used only sets what the game sees (its heap size, as on hardware); the host's own module copies (patch areas, key pages) are not the Switch's to count
+static uint64_t used_beside_heap(void) { return (uint64_t)DM_GAME_MEM_USED + big_bss_bytes() + (DM_GAME_MEM_MAP_LIMIT ? (uint64_t)atomic_load(&g_alias_mapped) : 0); }
 
 // For memory accounting (memstat.m): the range of the whole guest address space block (base = NULL when not initialized)
 void svc_guest_range(uint8_t **base, size_t *size) { *base = g_as; *size = g_reserve; }
 void svc_alias_range(uint8_t **base, size_t *size) { *base = g_alias; *size = g_alias_cap; }   // the alias region (GetInfo's), NULL before mem_init
+void mem_alias_use(uint64_t *cap, uint64_t *mapped, uint64_t *hw) { if (cap) *cap = g_alias_cap; if (mapped) *mapped = (uint64_t)atomic_load(&g_alias_mapped); if (hw) *hw = atomic_load(&g_alias_hw); }
 
 enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=4, I_HeapSize=5,
        I_TotalMem=6, I_UsedMem=7, I_DebuggerAttached=8, I_ResourceLimit=9, I_IdleTick=10, I_RandomEntropy=11,
@@ -378,12 +523,15 @@ static uint8_t g_seen[256];
 // The lock used to cover only the add and the delete, so two threads unmapping at once (stacks of exiting threads) could delete through a stale index and drop another live mapping
 #define MAX_MAP 4096
 static struct { uint64_t base, size, src; uint32_t state; } g_map[MAX_MAP];
+enum { SHARED_MEMORY_STATE = 6 };
+static unsigned g_shared_maps;   // under g_map_lock
 static int g_nmap;
+static hle_transfer_mapping *g_transfer_mappings;   // in-place service mappings, under g_map_lock
 static pthread_mutex_t g_map_lock = PTHREAD_MUTEX_INITIALIZER;
 // Punch the alias region's host pages that the game gave back before the last sweep and has not mapped again since (g_alias_aged), then age the ones given back since. Under g_map_lock,
 // so no MapPhysicalMemory opens a page while it is punched. Called by guest_file_thread every 10 s
 static void guest_file_sweep(void) {
-    if (!g_gf_punch || !g_alias_rel) return;
+    if (!g_gf_punch) return;
     size_t pg = (size_t)getpagesize(), nw = g_alias_cap / pg / 64 + 1;
     pthread_mutex_lock(&g_map_lock);
     for (size_t w = 0; w < nw; w++) {
@@ -447,7 +595,6 @@ static int64_t alias_unmapped(uint64_t off, uint64_t n) {
     }
     return c;
 }
-static _Atomic int64_t g_alias_mapped;   // bytes mapped in the alias region (page bitmap)
 
 // Word-at-a-time boundaries of the bitmap run containing p (guest page index).
 static uint64_t alias_mask(unsigned n) { return n == 64 ? UINT64_MAX : (UINT64_C(1) << n) - 1; }
@@ -485,6 +632,10 @@ static void alias_query(uint64_t addr, uint64_t *base, uint64_t *size, int *mapp
 // in again from a hole; they are only marked (g_alias_rel), and guest_file_sweep punches those still given back after a whole sweep interval. The heap's are punched at once
 static int guest_release(uintptr_t lo, uintptr_t hi, int alias) {
     if (g_gf_n) {
+        // While the pages are still writable. MADV_FREE after PROT_NONE returns 0 and drops nothing (memory.md). The punch is what gives the blocks back; this asks the
+        // kernel to drop the compressed copies of pages the guest has already freed, including alias pages that wait for the sweep.
+        if (madvise((void *)lo, hi - lo, MADV_FREE)) {}
+        if (madvise((void *)lo, hi - lo, MADV_DONTNEED)) {}
         if (mprotect((void *)lo, hi - lo, PROT_NONE)) die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
         if (g_gf_punch && !alias) guest_file_punch(lo, hi);
         else if (g_gf_punch) { size_t pg = (size_t)getpagesize(); for (uint64_t h = (lo - (uintptr_t)g_alias) / pg, e = (hi - (uintptr_t)g_alias) / pg; h < e; h++) g_alias_rel[h >> 6] |= UINT64_C(1) << (h & 63); }
@@ -544,14 +695,19 @@ static uint32_t map_arguments(uint64_t dst, uint64_t src, uint64_t size) {
     if (size > UINT64_MAX - src || size > UINT64_MAX - dst) return 0xD401;
     return memory_contains((uintptr_t)g_stack, g_stack_cap, dst, size) ? 0 : 0xDC01;
 }
-static int map_source_busy(uint64_t addr, uint64_t size) { // g_map_lock held; nonwrapping ranges
+static int map_source_borrowed(uint64_t addr, uint64_t size) { // g_map_lock held; nonwrapping ranges
     for (int i = 0; i < g_nmap; ++i)
-        if (addr < g_map[i].src + g_map[i].size && g_map[i].src < addr + size) return 1;
+        if (g_map[i].state != SHARED_MEMORY_STATE && addr < g_map[i].src + g_map[i].size && g_map[i].src < addr + size) return 1;
     return 0;
 }
+static int map_source_busy(uint64_t addr, uint64_t size) {
+    for (const hle_transfer_mapping *m = g_transfer_mappings; m; m = m->next)
+        if (addr < m->address + m->size && m->address < addr + size) return 1;
+    return map_source_borrowed(addr, size);
+}
 // Device-shared memory. On Horizon, NVN gives a memory pool's storage to the GPU through nvmap, whose device mapping (svcMapDeviceAddressSpaceAligned, KPageTableBase::LockForMapDeviceAddressSpace)
-// sets KMemoryAttribute_DeviceShared on those pages and counts each mapping. UnmapPhysicalMemory and a SetHeapSize that shrinks refuse any page with an attribute set (ResultInvalidCurrentMemory,
-// 0xD401; Atmosphère's KPageTableBase::UnmapPhysicalMemory and SetHeapSize), so the pages stay mapped until the pool is finalized. Without this, the host gave such pages back (guest_release put
+// sets KMemoryAttribute_DeviceShared on those pages and counts each mapping. UnmapMemory, UnmapPhysicalMemory and a shrinking SetHeapSize refuse ranges with that attribute
+// (ResultInvalidCurrentMemory, 0xD401), so the pages stay mapped until the pool is finalized. Without this, the host gave such pages back (guest_release put
 // fresh pages under them) while the pool's zero-copy Metal buffer still held the old ones: the CPU then wrote one copy and the GPU read the other. PR #1616 found that on Monster Jam Steel Titans 2,
 // whose light-grid compute shaders read stale counts from the pool and hung the GPU. hle_nvn.c registers each pool's storage at nvnMemoryPoolInitialize and removes it at nvnMemoryPoolFinalize;
 // a range registered twice (two pools over the same storage) stays shared until both are gone
@@ -613,19 +769,55 @@ static int map_source_backed(uint64_t src, uint64_t size) {
     module_data_query(m, off, &lo, &hi, &perm);
     return perm == 3 && hi >= lo && memory_contains(lo, hi - lo, off, size);
 }
+
+static int transfer_source_backed(uintptr_t address, size_t size) {
+    pthread_mutex_lock(&g_map_lock);
+    int backed = map_source_backed(address, size) && !map_source_busy(address, size);
+    pthread_mutex_unlock(&g_map_lock);
+    return backed;
+}
+
+int hle_map_transfer_memory(hle_transfer_mapping *mapping, uint32_t handle, uint64_t size, uint32_t owner_perm) {
+    hle_transfer_memory memory;
+    if (!size || !hle_get_transfer_memory(handle, &memory) || memory.size != size || memory.owner_perm != owner_perm)
+        return 0;
+    // The client and service share an address space. Keep the original backing in place until the service releases it.
+    pthread_mutex_lock(&g_map_lock);
+    int backed = map_source_backed(memory.address, memory.size) && !map_source_borrowed(memory.address, memory.size);
+    if (backed) {
+        if (!mapping->size) {
+            mapping->next = g_transfer_mappings;
+            g_transfer_mappings = mapping;
+        }
+        mapping->address = memory.address;
+        mapping->size = memory.size;
+    }
+    pthread_mutex_unlock(&g_map_lock);
+    return backed;
+}
+
+void hle_unmap_transfer_memory(hle_transfer_mapping *mapping) {
+    pthread_mutex_lock(&g_map_lock);
+    if (mapping->size) {
+        hle_transfer_mapping **link = &g_transfer_mappings;
+        while (*link != mapping) link = &(*link)->next;
+        *link = mapping->next;
+        *mapping = (hle_transfer_mapping){0};
+    }
+    pthread_mutex_unlock(&g_map_lock);
+}
 int svc_nro_deactivate(module_t *m) {
     pthread_mutex_lock(&g_map_lock);
     uint64_t base = (uintptr_t)m->base;
-    for (int i = 0; i < g_nmap; i++)
-        if (g_map[i].src < base + m->size && base < g_map[i].src + g_map[i].size) {
-            pthread_mutex_unlock(&g_map_lock); return 0;
-        }
-    m->loaded = 0;
-    pthread_mutex_unlock(&g_map_lock); return 1;
+    int busy = map_source_busy(base, m->size);
+    if (!busy) m->loaded = 0;
+    pthread_mutex_unlock(&g_map_lock);
+    return !busy;
 }
 static void map_source_query(uint64_t addr, uint64_t *base, uint64_t *size, uint32_t *attr, uint64_t *perm) {
     uint64_t lo = *base, remaining = *size; // the final free page can end at 2^64
     for (int i = 0; i < g_nmap; ++i) {
+        if (g_map[i].state == SHARED_MEMORY_STATE) continue;
         uint64_t src = g_map[i].src, end = src + g_map[i].size;
         uint64_t lower = lo, upper = remaining;
         if (addr >= src && addr < end) {
@@ -637,6 +829,32 @@ static void map_source_query(uint64_t addr, uint64_t *base, uint64_t *size, uint
         remaining = upper - (lower - lo); lo = lower;
     }
     *base = lo; *size = remaining;
+}
+
+// Clip an unmapped interval to the regions on either side of the queried address.
+static void query_gap_bound(uint64_t addr, uint64_t start, uint64_t end, uint64_t *lo, uint64_t *hi) {
+    if (end <= addr && end > *lo) *lo = end;
+    if (start > addr && start < *hi) *hi = start;
+}
+
+static void query_external_gap(uint64_t addr, uint64_t stack_lo, uint64_t stack_hi, const module_t *inactive,
+                               uint64_t *base, uint64_t *size) {
+    uint64_t lo = 0, hi = MACH_VM_MAX_ADDRESS;
+    uint64_t guest = (uintptr_t)g_as;
+    query_gap_bound(addr, guest, guest + g_reserve, &lo, &hi);
+    query_gap_bound(addr, stack_lo, stack_hi, &lo, &hi);
+    for (int i = 0; i < g_nmod; ++i) {
+        const module_t *m = &g_mod[i];
+        if (m == inactive || !m->loaded) continue;
+        uint64_t start = (uintptr_t)m->base;
+        query_gap_bound(addr, start, start + m->size, &lo, &hi);
+        if (m->patch_off < 0 && m->patch_len) {
+            uint64_t patch = start + m->patch_off;
+            query_gap_bound(addr, patch, patch + m->patch_len, &lo, &hi);
+        }
+    }
+    *base = lo;
+    *size = hi - lo;
 }
 
 // Diagnostic DM_ALIAS_WINDOWS=<window MB>: every 30 s, the mapped memory of each window of that size in the alias region (windows aligned to the size in absolute addresses, counted from the page
@@ -681,9 +899,54 @@ static void guest_caller(const uint64_t *r, char *buf, size_t n, uint64_t *via) 
     if (m) snprintf(buf, n, "%s+%#llx", m->name, (unsigned long long)(lr - (uint64_t)(uintptr_t)m->base));
     else snprintf(buf, n, "%#llx", (unsigned long long)lr);
 }
+static int region_off_cmp(const void *a, const void *b) {
+    uint64_t x = ((const region_t *)a)->off, y = ((const region_t *)b)->off;
+    return (x > y) - (x < y);
+}
+// Largest gap between live address regions. MapPhysicalMemory's high water does not drop when pages are unmapped, so a high water at the cap with few bytes mapped is either a hole
+// (a freed region, which VammManager's first-fit search reuses) or uncommitted pages inside a region the game still holds. out names the hole and the three largest regions.
+uint64_t mem_alias_hole(char *out, size_t n) {
+    if (!out || !n) return 0;
+    if (!g_alias) { snprintf(out, n, "alias region not ready"); return 0; }
+    pthread_mutex_lock(&g_rgn_lock);
+    int nr = g_nrgn;
+    region_t *t = nr ? malloc(sizeof *t * (size_t)nr) : NULL;
+    if (nr && !t) { pthread_mutex_unlock(&g_rgn_lock); snprintf(out, n, "region table: out of memory"); return 0; }
+    if (t) memcpy(t, g_rgn, sizeof *t * (size_t)nr);
+    pthread_mutex_unlock(&g_rgn_lock);
+    if (nr) qsort(t, (size_t)nr, sizeof *t, region_off_cmp);
+    uint64_t sum = 0, cursor = 0, hole = 0, hat = 0;
+    int top[3] = {-1, -1, -1};
+    for (int i = 0; i < nr; i++) {
+        uint64_t off = t[i].off, end = off + t[i].size;
+        if (off > g_alias_cap) off = g_alias_cap;
+        if (end > g_alias_cap) end = g_alias_cap;
+        if (off > cursor && off - cursor > hole) { hole = off - cursor; hat = cursor; }
+        if (end > cursor) cursor = end;
+        sum += t[i].size;
+        for (int k = 0; k < 3; k++) if (top[k] < 0 || t[i].size > t[top[k]].size) {
+            for (int j = 2; j > k; j--) top[j] = top[j - 1];
+            top[k] = i; break;
+        }
+    }
+    if (g_alias_cap > cursor && g_alias_cap - cursor > hole) { hole = g_alias_cap - cursor; hat = cursor; }
+    size_t o = (size_t)snprintf(out, n, "%d live regions, %.2f GB reserved, largest free hole %.1f MB at +%.2f GB", nr, sum / 1073741824.0, hole / 1048576.0, hat / 1073741824.0);
+    for (int k = 0; k < 3 && top[k] >= 0 && o < n; k++)
+        o += (size_t)snprintf(out + o, n - o, "%s %.0f MB at +%.2f GB (%s)", k ? ";" : "; biggest", t[top[k]].size / 1048576.0, t[top[k]].off / 1073741824.0, t[top[k]].who);
+    free(t);
+    return hole;
+}
 static void region_ask(uint64_t *r, int param) {
     (void)param;
     t_rgn_size = r[2]; guest_caller(r, t_rgn_who, sizeof t_rgn_who, &t_rgn_via);
+    if (r[2] < 0x2000000) return;   // 32 MB and up: a bank swap. Smaller regions are the steady traffic
+    char fit[700]; uint64_t hole = mem_alias_hole(fit, sizeof fit);
+    if (hole < r[2]) {
+        static int lines;
+        if (lines < 20) { lines++;
+            LOG("[mem] address region %.2f MB for %s does not fit. %s. VammManager searches first-fit and reuses a region FreeAddressRegion gave back; a hole smaller than the request is space a live region still owns",
+                r[2] / 1048576.0, t_rgn_who, fit); }
+    }
 }
 static void region_got(uint64_t *r, int param) {
     mem_init();
@@ -812,19 +1075,14 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // os::ResultOutOfMemory and aborts on anything else; Donkey Kong Country: Tropical Freeze finds its heap size by a binary search between 3 and 6 GB, which needs the error back
         if (size > g_heap_cap) { LOG("SetHeapSize OOM: req %#zx > cap %#zx", size, g_heap_cap); regs[0] = 0xD001; return 0; }
         pthread_mutex_lock(&g_map_lock);
-        size_t previous = g_heap_cur, image = image_bytes();
+        size_t previous = g_heap_cur;
         if (size < previous && (map_source_busy((uintptr_t)g_heap + size, previous - size) || device_shared((uintptr_t)g_heap + size, previous - size, "SetHeapSize shrinking over"))) {
             pthread_mutex_unlock(&g_map_lock); regs[0] = 0xD401; return 0;
         }
-        if (image > APP_POOL || size > APP_POOL - image) {   // ResultLimitReached; games retry in 2 MB decrements
-            // Logged once (Mario's retries would repeat it): a game that sizes its heap as pool − used memory and does not retry stops here when its modules are larger than the used memory reported
-            // (profile mem_used; the NSP script's probe boot reads this line, and sets mem_used when no SetHeapSize succeeds afterwards)
-            static int once; if (!once++) LOG("[mem] SetHeapSize %#zx + modules %#zx > app pool %#llx (used memory reported %#llx + bss %#zx)", size, image_bytes() - big_bss_bytes(),
-                                              (unsigned long long)APP_POOL, (unsigned long long)DM_GAME_MEM_USED, big_bss_bytes());
-            pthread_mutex_unlock(&g_map_lock); regs[0] = 0x10801; return 0;
-        }
-        uint64_t charged = (uint64_t)DM_GAME_MEM_USED + big_bss_bytes() + atomic_load(&g_alias_mapped);
-        if (DM_GAME_MEM_MAP_LIMIT && (charged > APP_POOL || size > APP_POOL - charged)) {
+        uint64_t used = used_beside_heap();
+        if (used > APP_POOL || size > APP_POOL - used) {   // ResultLimitReached: more than the total less the used memory GetInfo reports; games retry in 2 MB decrements
+            // Logged once (Mario's retries would repeat it)
+            static int once; if (!once++) LOG("[mem] SetHeapSize %#zx > app pool %#llx less used memory %#llx", size, (unsigned long long)APP_POOL, (unsigned long long)used);
             pthread_mutex_unlock(&g_map_lock); regs[0] = 0x10801; return 0;
         }
         int rc = 0;
@@ -866,7 +1124,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (g_flag.svc) LOG("MapMemory %#llx <- %#llx +%#llx", dst, src, size);
         regs[0] = 0; return 0;
     }
-    case 0x05: {  // UnmapMemory(dst, src, size): contents are moved back to the source region; a 16K page may be shared with an adjacent mapping, permissions are not revoked
+    case 0x05: {  // UnmapMemory(dst, src, size): copy the contents back to the source and discard eligible stack pages
         uint64_t dst = regs[0], src = regs[1], size = regs[2];
         uint32_t result = map_arguments(dst, src, size);
         if (result) { regs[0] = result; return 0; }
@@ -874,9 +1132,17 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         int k = map_find(dst, size);
         if (!k || g_map[k - 1].base != dst || g_map[k - 1].size != size || g_map[k - 1].src != src) {
             pthread_mutex_unlock(&g_map_lock); LOG("UnmapMemory does not match a mapping %#llx+%#llx", dst, size); regs[0] = 0xD401; return 0; }
+        if (device_shared(dst, size, "UnmapMemory")) { pthread_mutex_unlock(&g_map_lock); regs[0] = 0xD401; return 0; }
         dm_guest_write_prepare((void *)src, size);
         memcpy((void *)src, (void *)dst, size);
         map_del(k - 1);
+        // Random stack addresses leave dirty pages throughout the region. Reclaim whole anonymous host pages and preserve any 4 KiB neighbors
+        // sharing an edge page. MapMemory reopens reclaimed pages. File-backed stacks retain their backing.
+        if (!g_gf_n) {
+            uintptr_t mask = (size_t)getpagesize() - 1;
+            uintptr_t release_lo = (dst + mask) & ~mask, release_hi = (dst + size) & ~mask;
+            if (release_hi > release_lo) (void)guest_release(release_lo, release_hi, 0);
+        }
         pthread_mutex_unlock(&g_map_lock);
         regs[0] = 0; return 0;
     }
@@ -887,12 +1153,13 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         uint64_t base, size, state, perm;
         uint32_t attr = 0;
         int k;
+        module_t *mm;
         pthread_mutex_lock(&g_map_lock);   // the registry branches read g_map; the other branches are cheap, so the lock simply spans the whole chain
         uint64_t ab = (uintptr_t)g_alias, ae = ab + g_alias_cap, rb = 0, rn = 0;
         int mapped = 0, in_alias = addr >= ab && addr < ae;
         if (in_alias) alias_query(addr, &rb, &rn, &mapped);
         if (a >= g_heap && a < g_heap + g_heap_cur) { base=(uint64_t)g_heap; size=g_heap_cur; state=5/*Heap*/; perm=3; }
-        else if ((k = map_find(addr, 1))) { base=g_map[k-1].base; size=g_map[k-1].size; state=g_map[k-1].state; perm=3; }
+        else if ((k = map_find(addr, 1))) { base=g_map[k-1].base; size=g_map[k-1].size; state=g_map[k-1].state; perm=state == SHARED_MEMORY_STATE ? 1 : 3; }
         else if (in_alias && mapped) { base=rb; size=rn; state=5; perm=3; }
         else if (a >= g_as && a < g_as + g_reserve) {   // free: up to the adjacent mapping/heap boundary
             uint64_t lo = (uint64_t)g_as, hi = (uint64_t)g_as + g_reserve;
@@ -916,16 +1183,16 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
                 if (g_map[i].base > addr && g_map[i].base < hi) hi = g_map[i].base;
             }
             base=lo; size=hi-lo; state=0; perm=0; }
-        else if (module_of(a)) {
+        else if ((mm = module_of(a)) && mm->loaded) {
             // Loaded module: report the regions in Horizon's layout -- code [0, ro) Code+RX, read-only [ro, data) Code+R, data and bss [data, patch area) CodeData+RW.
             // The SDK's C++ exception unwinding (nn::ro::detail::GetExceptionInfo) walks back from the PC over "Code+RX" regions to find the module start, forward over Code then CodeData to find its end, then reads MOD0 at the module start for .eh_frame_hdr.
             // Previously "the 4 KiB page around it, Code+RX" was reported: the backward walk ran on into other memory, found no MOD0 and aborted (Engage's IL2CPP throws a C++ exception for every managed exception).
             // The rewriter's patch area is reported as CodeData+RX: modules sit back to back in the host, and an executable patch area reported as Code+RX would merge the previous module into the backward walk
             // Modules with the patch area before the base (patch_off < 0): the patch area is reported alone as CodeData+RX, and data and bss run to the end of the image, or to a back patch area
             // (patch_nso.py TWO), which is reported as CodeData+RX like a patch area after the image
-            module_t *mm = module_of(a); uint64_t off = (uint64_t)(a - mm->base), mb = (uint64_t)mm->base;
+            uint64_t mb = (uintptr_t)mm->base, off = addr - mb;
             uint64_t ro = mm->ro_off ? mm->ro_off : mm->text_end, da = mm->data_off ? mm->data_off : ro, pa = mm->patch_off > 0 ? (uint64_t)mm->patch_off : mm->back_len ? mm->back_off : mm->size;
-            if (a < mm->base)  { base = mb + mm->patch_off; size = mm->patch_len; state = 4/*CodeData*/; perm = 5; }
+            if (addr < mb)     { base = mb + mm->patch_off; size = mm->patch_len; state = 4/*CodeData*/; perm = 5; }
             else if (off < ro) { base = mb;      size = ro;            state = 3/*Code*/;     perm = 5; }
             else if (off < da) { base = mb + ro; size = da - ro;       state = 3/*Code*/;     perm = 1; }
             else if (off < pa) { base = mb + da; size = pa - da;       state = 4/*CodeData*/; perm = 3; }
@@ -936,14 +1203,18 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
                 base = mb + lo; size = hi - lo;
             }
         }
-        else {
+        else if (addr >= MACH_VM_MAX_ADDRESS) {
+            // Horizon describes addresses past the process limit with a reserved block whose end wraps to zero.
+            base = MACH_VM_MAX_ADDRESS; size = 0 - base; state = 0x10; perm = 0;
+        } else {
             // The address lies in "the current host thread's stack": report the whole stack (state 0xB = stack). When the SDK initializes the main thread record it queries here with the sp at that moment and takes the reported range as the main thread stack;
             // later nn::os::GetCurrentStackInfo asserts that sp is still inside that range and aborts if not. Previously every address outside the guest address space was reported as "the 4 KiB page containing it",
             // so the main thread stack was recorded as one page. Whether the sp at init and a later sp share a page depends on the absolute position of the host stack top, which moves with the total length of environment variables / launch arguments (a different environment occasionally aborts at startup).
-            uint64_t top = (uint64_t)pthread_get_stackaddr_np(pthread_self()), ssz = pthread_get_stacksize_np(pthread_self());
-            if (addr < top && addr >= top - ssz) { base = top - ssz; size = ssz; state = 0xB/*Stack*/; perm = 3; }
-            // Other host memory: report "free, no permissions" (the 4 KiB page around it) as Horizon does for unmapped addresses. It used to report Code+RX, and GetExceptionInfo walking back from main merged on through host memory down to 0
-            else { base=addr & ~0xFFFull; size=0x1000; state=0/*Free*/; perm=0; } }
+            uint64_t top = (uintptr_t)pthread_get_stackaddr_np(pthread_self()), ssz = pthread_get_stacksize_np(pthread_self());
+            uint64_t bottom = top - ssz;
+            if (addr < top && addr >= bottom) { base = bottom; size = ssz; state = 0xB/*Stack*/; perm = 3; }
+            else { query_external_gap(addr, bottom, top, mm, &base, &size); state = 0/*Free*/; perm = 0; }
+        }
         map_source_query(addr, &base, &size, &attr, &perm);
         pthread_mutex_unlock(&g_map_lock);
         if (mi) {
@@ -954,12 +1225,55 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         }
         regs[0] = 0; regs[1] = 0; return 0;
     }
+    case 0x13: case 0x14: {  // MapSharedMemory / UnmapSharedMemory: immutable service data, in free alias pages
+        const hle_readonly_shmem *memory = hle_get_readonly_shmem((uint32_t)regs[0]);
+        uintptr_t addr = regs[1]; size_t size = regs[2], pg = (size_t)getpagesize();
+        if (!memory) { regs[0] = 0xe401u; return 0; }
+        if (addr & (pg - 1)) { regs[0] = 0xcc01u; return 0; }
+        if (size != memory->size || !size || (size & (pg - 1))) { regs[0] = 0xca01u; return 0; }
+        if (num == 0x13 && regs[3] != 1) { regs[0] = 0xd801u; return 0; }
+        if (!memory_contains((uintptr_t)g_alias, g_alias_cap, addr, size)) { regs[0] = 0xdc01u; return 0; }
+        pthread_mutex_lock(&g_map_lock);
+        int k = map_find(addr, size);
+        uint32_t result = 0xd401u;
+        if (num == 0x13 && !k && g_nmap < MAX_MAP && alias_unmapped(addr - (uintptr_t)g_alias, size) == (int64_t)(size / 4096)) {
+            void *dst = (void *)addr;
+            if (mprotect(dst, size, PROT_READ | PROT_WRITE)) die("MapSharedMemory writable mapping: errno=%d", errno);
+            dm_guest_write_prepare(dst, size);
+            memcpy(dst, memory->bytes, size);
+            if (mprotect(dst, size, PROT_READ)) die("MapSharedMemory read-only protection: errno=%d", errno);
+            if (g_gf_n) {
+                size_t first = (addr - (uintptr_t)g_alias) / pg;
+                for (size_t i = first; i < first + size / pg; ++i) {
+                    uint64_t bit = UINT64_C(1) << (i & 63);
+                    g_alias_rel[i >> 6] &= ~bit;
+                    g_alias_aged[i >> 6] &= ~bit;
+                }
+            }
+            map_add(addr, size, (uintptr_t)memory, SHARED_MEMORY_STATE);
+            ++g_shared_maps;
+            result = 0;
+        } else if (num == 0x14 && k && g_map[k-1].state == SHARED_MEMORY_STATE && g_map[k-1].base == addr &&
+                   g_map[k-1].size == size && g_map[k-1].src == (uintptr_t)memory) {
+            if (!guest_release(addr, addr + size, 1)) {
+                size_t first = (addr - (uintptr_t)g_alias) / pg;
+                for (size_t i = first; i < first + size / pg; ++i) g_alias_exposed[i >> 6] |= UINT64_C(1) << (i & 63);
+            }
+            map_del(k - 1);
+            --g_shared_maps;
+            result = 0;
+        }
+        pthread_mutex_unlock(&g_map_lock);
+        regs[0] = result;
+        return 0;
+    }
     case 0x2C: case 0x2D: {  // MapPhysicalMemory / UnmapPhysicalMemory(addr, size): only allowed inside the alias region (used by the SDK's VammManager)
         uintptr_t a = regs[0]; size_t size = regs[1];
         if (!size || ((a | size) & 0xfff) || !memory_contains((uintptr_t)g_alias, g_alias_cap, a, size)) {
             LOG("SVC %#x outside the alias region %p+%#zx", num, (void *)a, size); regs[0] = 0xD401; return 0;
         }
         pthread_mutex_lock(&g_map_lock);
+        if (g_shared_maps && map_find(a, size)) { pthread_mutex_unlock(&g_map_lock); regs[0] = 0xd401u; return 0; }
         // The SDK extends committed windows across borrowed stack sources
         // (Raging Loop, StandardAllocator). Recommit preserves every live byte;
         // only decommit can invalidate backing required for eventual copyback.
@@ -972,7 +1286,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // UnmapPhysicalMemory of the 3.15 GB block and the same map again). Without the limit the mapped total went past the pool in the first minute and the freed block stayed mapped.
         // Off by default: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports
         if (DM_GAME_MEM_MAP_LIMIT && num == 0x2C) {
-            int64_t room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes()) - atomic_load(&g_alias_mapped);
+            int64_t room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + used_beside_heap());   // used_beside_heap holds the mapped pages with mem_map_limit
             if (need && need > room) {
                 pthread_mutex_unlock(&g_map_lock);
                 static _Atomic int nref; if (atomic_fetch_add(&nref, 1) < 8) LOG("[mem] MapPhysicalMemory +%#zx refused: %.2f GB mapped, the application pool is full (ResultLimitReached, the SDK frees cached pages and retries)",
@@ -1012,8 +1326,20 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // the SDK maps pages that are already mapped and unmaps ranges larger than what it mapped (Engage unmaps 0x1000000 and then 0x103f000 at the same address), so counting requested sizes went negative
         { int64_t d = alias_pages(off, size, commit) * 4096, before = atomic_fetch_add(&g_alias_mapped, d), after = before + d;
           pthread_mutex_unlock(&g_map_lock);
-          if (before >> 28 != after >> 28) LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB)", after / 1073741824.0, APP_POOL / 1073741824.0); }
+          if (before >> 28 != after >> 28) LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB)", after / 1073741824.0, APP_POOL / 1073741824.0);
+          if (!commit && size >= (16u << 20)) { char why[64]; snprintf(why, sizeof why, "scene give-back %zu MB", size >> 20); mem_room_log(why); } }
         regs[0] = 0; return 0;
+    }
+    case 0x15: {  // CreateTransferMemory(→w1 handle; x1 address, x2 size, w3 owner permission)
+        hle_transfer_memory memory = { regs[1], regs[2], (uint32_t)regs[3] };
+        if (memory.address & 0xfff) { regs[0] = 0xcc01u; return 0; }
+        if (!memory.size || (memory.size & 0xfff)) { regs[0] = 0xca01u; return 0; }
+        if (!memory.address || memory.size > UINTPTR_MAX - memory.address) { regs[0] = 0xd401u; return 0; }
+        if (memory.owner_perm != 0 && memory.owner_perm != 1 && memory.owner_perm != 3) { regs[0] = 0xd801u; return 0; }
+        if (!transfer_source_backed(memory.address, memory.size)) { regs[0] = 0xd401u; return 0; }
+        uint32_t h = hle_new_transfer_memory(memory);
+        if (!h) { regs[0] = 0xce01u; return 0; }
+        regs[0] = 0; regs[1] = h; return 0;
     }
     case 0x26: {  // Break(reason, ptr, size): SDK fatal abort
         uint32_t res = (regs[1] && regs[2] >= 4) ? *(uint32_t *)regs[1] : 0;
@@ -1040,9 +1366,9 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         case I_StackAddr: v = (uint64_t)g_stack; break;   case I_StackSize: v = g_stack_cap; break;
         case I_TotalMem: case I_TotalNonSys: v = APP_POOL; break;
         case I_UsedMem:  case I_UsedNonSys:  pthread_mutex_lock(&g_map_lock);
-                                             v = g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes();   // profile mem_used, 64 MB unless the game needs more (see mem_used in dm/games/README.md)
-                                             // with mem_map_limit, the pages mapped in the alias region count too, as on Horizon (the limit in MapPhysicalMemory is the pool less this)
-                                             if (DM_GAME_MEM_MAP_LIMIT) v += (uint64_t)atomic_load(&g_alias_mapped);
+                                             // profile mem_used (64 MB unless the game's hardware heap needs more: mem_used in dm/games/README.md) and the giant bss; with mem_map_limit the pages
+                                             // mapped in the alias region count too, as on Horizon. SetHeapSize and MapPhysicalMemory charge the same figure
+                                             v = g_heap_cur + used_beside_heap();
                                              pthread_mutex_unlock(&g_map_lock); break;
         // the system resource the NPDM declares (profile sys_resource; 32 MB without the key). The SDK's IsVirtualAddressMemoryEnabled is "total != 0": Big Brain Academy's nninitStartup
         // asks StandardAllocator for 60 GB of virtual address memory when it is, and sets a heap only when it is not (its NPDM declares none)

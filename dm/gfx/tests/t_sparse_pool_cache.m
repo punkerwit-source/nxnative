@@ -82,12 +82,12 @@ int main(void) { @autoreleasepool {
 
     // A 4 KB request over the texture's page: no registration, serial change or CPU write at the request, a note at the next submission
     uint64_t rg = atomic_load(&g_reg_gen), dg = nvn_dirty_now(); sg = g_ser_gen;
-    args_sync_dirty(); memset(g_args_dirty, 0, sizeof g_args_dirty);
+    args_sync_dirty(); for (int st = 0; st < 6; st++) g_args_wrote[st] = g_args_seq;   // as if every stage had just written its block
     CHECK(map(&virt, &phys, 0, 0x10000, 0x1000), "the texture's page mapped from elsewhere");
     CHECK(atomic_load(&g_reg_gen) == rg && g_ser_gen == sg && nvn_dirty_now() == dg, "the request itself changes no registration, serial or CPU-write generation");
     next_sub();
     CHECK(g_ser_gen == sg + 1, "the next submission notes the texture's serial once");
-    args_sync_dirty(); int all = 1; for (unsigned i = 0; i < sizeof g_args_dirty; i++) all &= g_args_dirty[i] != 0;
+    args_sync_dirty(); int all = 1; for (int st = 0; st < 6; st++) all &= args_changed(st);
     CHECK(all, "the note sends cached argument blocks through their check");
     pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &table);
     CHECK(g_stat_pool_builds == builds, "the pool table is patched, not built whole");
@@ -105,6 +105,76 @@ int main(void) { @autoreleasepool {
     CHECK(gpu_read(table, 0) == C, "the handle table reads the newly mapped page");
     pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &table);
     CHECK(gpu_read(table, 1) == C, "so does the pool table");
+
+    // Views of a sparse texture whose finest level is not mapped. Its host texture is the view of levels [1, 3) (sparse_view), and a texture view's levels count from NVN's level 0:
+    // Resident Evil 4 samples its streamed textures through views of levels 1 + 0 and 2 + 0. The level 2 view started past the host texture's two levels and was left out (the
+    // dummy); the level 1 view read level 2
+    const uint32_t D = 0xff0a0b0c, E = 0xff0d0e0f; const uint64_t VO = 0x100000, PO = 0x80000;
+    NVNtexture tm; h_nvnTextureBuilderSetDefaults(&tb);
+    h_nvnTextureBuilderSetTarget(&tb, NVN_TEXTURE_TARGET_2D); h_nvnTextureBuilderSetWidth(&tb, 256); h_nvnTextureBuilderSetHeight(&tb, 256); h_nvnTextureBuilderSetLevels(&tb, 3);
+    h_nvnTextureBuilderSetFormat(&tb, NVN_FORMAT_RGBA8); h_nvnTextureBuilderSetFlags(&tb, NVN_TEXTURE_FLAGS_SPARSE);
+    h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&virt, VO);
+    CHECK(h_nvnTextureInitialize(&tm, &tb), "sparse texture of three levels");
+    const tex_t *mt = (const tex_t *)&tm;
+    uint64_t l1 = nvn_tex_level_offset(&mt->d, 1), l2 = nvn_tex_level_offset(&mt->d, 2), lend = (mt->L.size + 0xFFF) & ~0xFFFull;
+    CHECK(l1 && !(l1 & 0xFFF) && l2 > l1 && PO + lend - l1 <= 0x100000, "level 1 starts on a page, and levels 1 and 2 fit the physical pool");
+    for (uint64_t o = l1; o < lend; o += 4) *(uint32_t *)(mem + PO + o - l1) = o < l2 ? D : E;
+    CHECK(map(&virt, &phys, VO + l1, PO, lend - l1), "levels 1 and 2 mapped, level 0 not");
+    view_t v1 = {.set_levels = 1, .base_level = 1}, v2 = {.set_levels = 1, .base_level = 2}, v0 = {.set_levels = 1, .base_level = 0, .nlevels = 1};
+    mtl_reg_tex(2, mt, &v1); mtl_reg_tex(3, mt, &v2); mtl_reg_tex(4, mt, &v0);
+    g_seen_done[0] |= 0x1c; g_seen_typed[0][0] |= 0x1c;
+    next_sub();
+    pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &table);
+    CHECK(gpu_read(table, 2) == D, "a view from level 1 reads level 1");
+    CHECK(gpu_read(table, 3) == E, "a view from level 2 reads level 2, not the dummy");
+    CHECK(gpu_read(table, 4) == D, "a view of the unmapped level 0 reads the first mapped level, as the texture's own binding does");
+    mtl_reg_tex(2, NULL, NULL); mtl_reg_tex(3, NULL, NULL); mtl_reg_tex(4, NULL, NULL);
+    h_nvnTextureFinalize(&tm);
+
+    // An identical registration revives an ID pruned from the sparse scan while it was gone.
+    mtl_reg_tex_gone(1);
+    CHECK(map(&virt, &phys, past, 0x50000, 0x1000), "a mapping beside the gone descriptor's texture");
+    next_sub();
+    CHECK(g_treg[1].gone && !g_treg[1].sp, "the scan removes the gone descriptor");
+    mtl_reg_tex(1, (const tex_t *)&tx, NULL);
+    CHECK(!g_treg[1].gone && g_treg[1].sp, "an identical registration restores sparse tracking");
+    pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &table);
+    CHECK(gpu_read(table, 1) == C, "the revived descriptor reads the current page");
+    sg = g_ser_gen;
+    CHECK(map(&virt, &phys, 0, 0x10000, 0x1000), "remap the revived descriptor's page");
+    next_sub();
+    CHECK(g_ser_gen == sg + 1, "the next submission notes the revived descriptor's serial");
+    pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &table);
+    CHECK(gpu_read(table, 1) == B, "the revived descriptor reads the newly mapped page");
+
+    // A scene change finalizes a pool while its descriptor stays registered.
+    // Make the freed pool object's page inaccessible, then map the live pool:
+    // the next submission must retire the old sparse-scan entry without reading it.
+    const size_t page = (size_t)getpagesize();
+    pool_t *dead = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    CHECK(dead != MAP_FAILED, "pool object page allocated");
+    pb = (pool_builder_t){.size = 0x20000, .flags = NVN_MEMORY_POOL_FLAGS_VIRTUAL};
+    CHECK(h_nvnMemoryPoolInitialize((NVNmemoryPool *)dead, (NVNmemoryPoolBuilder *)&pb), "temporary virtual pool");
+    CHECK(map(dead, &phys, 0, 0x30000, 0x1000), "temporary pool mapped sparsely");
+    h_nvnTextureBuilderSetDefaults(&tb);
+    h_nvnTextureBuilderSetTarget(&tb, NVN_TEXTURE_TARGET_2D);
+    h_nvnTextureBuilderSetWidth(&tb, 32); h_nvnTextureBuilderSetHeight(&tb, 32);
+    h_nvnTextureBuilderSetFormat(&tb, NVN_FORMAT_RGBA8);
+    h_nvnTextureBuilderSetFlags(&tb, NVN_TEXTURE_FLAGS_SPARSE);
+    h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)dead, 0);
+    NVNtexture td;
+    CHECK(h_nvnTextureInitialize(&td, &tb), "temporary sparse texture");
+    mtl_reg_tex(5, (const tex_t *)&td, NULL);
+    CHECK(g_treg[5].sp, "temporary descriptor belongs to sparse scan");
+    h_nvnTextureFinalize(&td);
+    CHECK(!g_treg[5].gone, "texture finalization keeps the registered descriptor live until its pool ends");
+    h_nvnMemoryPoolFinalize((NVNmemoryPool *)dead);
+    CHECK(g_treg[5].gone, "finalization marks the descriptor gone");
+    CHECK(!mprotect(dead, page, PROT_NONE), "freed pool object is inaccessible");
+    CHECK(map(&virt, &phys, past, 0x40000, 0x1000), "another pool's mapping triggers sparse notes");
+    next_sub();
+    CHECK(!g_treg[5].sp, "gone descriptor removed without reading freed pool object");
+    CHECK(!munmap(dead, page), "temporary object page released");
 
     h_nvnTextureFinalize(&tx);
     h_nvnMemoryPoolFinalize((NVNmemoryPool *)&virt); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&phys);
