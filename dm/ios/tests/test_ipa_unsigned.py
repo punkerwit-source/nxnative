@@ -17,7 +17,8 @@ import romfs_image
 
 GAME = '010015100B514000'
 SCRIPT = (REPO / 'dm/ios/tools/build_ipa.sh').read_text()
-SIGNING = SCRIPT[SCRIPT.index('# The entitlements of an unsigned IPA'):SCRIPT.index('\nP=Payload/DmIOS.app\n')]
+ENTITLEMENTS = SCRIPT[SCRIPT.index('write_entitlements()'):SCRIPT.index('[ -n "${GAME:-}" ]')]
+SIGNING = ENTITLEMENTS + SCRIPT[SCRIPT.index('# The entitlements of an unsigned IPA'):SCRIPT.index('\nP=Payload/DmIOS.app\n')]
 PACKING = SCRIPT[SCRIPT.index('\nP=Payload/DmIOS.app\n'):]
 PREAMBLE = 'set -u\nt() { :; }; die() { echo "$*" >&2; exit 1; }\ngp() { python3 "$PROFILE_TOOL" "$GAME" "$1"; }\n'
 CAN_SIGN = sys.platform == 'darwin' and shutil.which('codesign') and shutil.which('cc')
